@@ -24,6 +24,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _BOOK = _ROOT / "grok-trading-desk" / "logs" / "dex_arc.json"
 _CHAIN = (os.environ.get("ARC_DEXSCREENER_CHAIN") or "arc").strip() or "arc"
 _TOKEN_SELECTOR = "0xfc0c546a"
+_SYMBOL_SELECTOR = "0x95d89b41"
 _CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _TTL = float(os.environ.get("ARC_DEX_TTL", "20"))
 
@@ -82,6 +83,83 @@ def _rpc(method: str, params: list[Any]) -> Any:
         except Exception as exc:  # noqa: BLE001
             last = exc
     raise RuntimeError(sanitize_exc(last) if last else "rpc failed")
+
+
+def _decode_symbol(raw: str) -> str:
+    h = raw[2:] if raw.startswith("0x") else raw
+    if len(h) < 64 or len(h) % 2:
+        return ""
+    text = ""
+    if len(h) == 64:
+        try:
+            text = bytes.fromhex(h).rstrip(b"\x00").decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return ""
+    else:
+        try:
+            strlen = int(h[64:128], 16)
+        except ValueError:
+            return ""
+        if not 0 < strlen <= 32:
+            return ""
+        try:
+            text = bytes.fromhex(h[128:128 + strlen * 2]).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return ""
+    out = "".join(ch for ch in text if ch.isalnum() or ch == "_")[:16]
+    return out.upper()
+
+
+def token_symbol(token: str) -> str:
+    """ERC-20 symbol() via eth_call. Empty if the node does not answer."""
+    addr = (token or "").strip()
+    if not (addr.startswith("0x") and len(addr) == 42):
+        return ""
+    try:
+        raw = _rpc("eth_call", [{"to": addr, "data": _SYMBOL_SELECTOR}, "latest"])
+    except Exception:
+        return ""
+    if not isinstance(raw, str):
+        return ""
+    return _decode_symbol(raw)
+
+
+_IDENT_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+_IDENT_TTL = 60.0
+
+
+def market_identity(curve: str) -> dict[str, str]:
+    """Real ticker and token CA. Never invents a name when both reads miss."""
+    curve = (curve or "").strip()
+    key = curve.lower()
+    now = time.time()
+    hit = _IDENT_CACHE.get(key)
+    if hit and now - hit[0] < _IDENT_TTL:
+        return hit[1]
+    token = token_of(curve) if curve.startswith("0x") else ""
+    symbol = token_symbol(token) if token else ""
+    source = "symbol()" if symbol else ""
+    if not symbol:
+        pair = best_pair(curve)
+        base = pair.get("baseToken") if isinstance(pair, dict) else None
+        if isinstance(base, dict):
+            symbol = "".join(
+                ch for ch in str(base.get("symbol") or "") if ch.isalnum() or ch == "_"
+            )[:16].upper()
+            if symbol:
+                source = "dexscreener"
+            listed = str(base.get("address") or "")
+            if listed.startswith("0x") and len(listed) == 42 and not token:
+                token = listed
+    out = {
+        "symbol": symbol,
+        "token": token,
+        "curve": curve,
+        "source": source,
+    }
+    if key.startswith("0x"):
+        _IDENT_CACHE[key] = (now, out)
+    return out
 
 
 def token_of(curve: str) -> str:

@@ -12,6 +12,7 @@ Optional:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -153,22 +154,39 @@ async def narrative_x_pulse(token: str, address: str = "") -> dict[str, Any]:
             "error": "X API disabled or no bearer",
         }
 
-    sym = _clean_query_token(token)
-    ca_short = ""
-    if address and address.startswith("0x") and len(address) >= 10:
-        ca_short = address[:10]
+    from desk_realtime.arc_dex import market_identity
 
-    # Prefer cashtag / ticker; CA fragment as secondary OR
-    parts = [f"${sym}", sym, "Arc"]
-    if ca_short:
-        parts.append(ca_short)
-    # recent search operators — keep simple for Free/Basic tiers
-    query = f"({parts[0]} OR {parts[1]}) lang:en -is:retweet"
+    ident = (
+        await asyncio.to_thread(market_identity, address)
+        if address.startswith("0x")
+        else {}
+    )
+    live_sym = ident.get("symbol") or ""
+    desk_sym = _clean_query_token(token)
+    # WARPA / WARPB are desk labels, not tickers anyone posts.
+    if live_sym:
+        sym = live_sym
+    elif len(desk_sym) == 5 and desk_sym.startswith("WARP"):
+        sym = ""
+    else:
+        sym = desk_sym
+    cas: list[str] = []
+    for raw in (ident.get("token"), address):
+        a = (raw or "").strip()
+        if a.startswith("0x") and len(a) == 42 and a.lower() not in cas:
+            cas.append(a.lower())
+    parts: list[str] = []
+    if sym:
+        parts.extend([f"${sym}", sym])
+    parts.extend(cas)
+    if not parts:
+        parts = [desk_sym or "Arc"]
+    # Recent-search operators. Full CA, not a 10-character prefix.
+    query = "(" + " OR ".join(parts) + ") lang:en -is:retweet"
 
     raw = await search_recent(query)
-    if not raw.get("ok"):
-        # Fallback: ticker only
-        raw = await search_recent(f"{sym} (meme OR crypto OR Arc)")
+    if not raw.get("ok") and sym:
+        raw = await search_recent(f"(${sym} OR {sym}) lang:en -is:retweet")
     if not raw.get("ok"):
         return {
             "ok": False,
@@ -178,6 +196,8 @@ async def narrative_x_pulse(token: str, address: str = "") -> dict[str, Any]:
             "source": "x",
             "error": raw.get("error") or "search failed",
             "query": raw.get("query"),
+            "symbol": sym,
+            "token": ident.get("token") or address,
         }
 
     tweets = raw.get("tweets") or []
@@ -198,6 +218,8 @@ async def narrative_x_pulse(token: str, address: str = "") -> dict[str, Any]:
         "score_hint": round(hint, 3),
         "samples": samples,
         "query": raw.get("query"),
+        "symbol": sym,
+        "token": ident.get("token") or address,
         "source": "x",
         "error": "",
         "cached": bool(raw.get("cached")),

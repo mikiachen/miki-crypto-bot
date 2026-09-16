@@ -220,6 +220,14 @@ async def runScanner(bus: DeskPublisher, rng: random.Random) -> AgentResult:
 
     target = pick_scan_target(rng)
     name, address = target.symbol, target.address
+    try:
+        from desk_realtime.arc_dex import market_identity
+
+        ident = await asyncio.to_thread(market_identity, address)
+        if ident.get("symbol"):
+            name = ident["symbol"]
+    except Exception:
+        ident = {}
     scouted_count += 1
     fee_note = f" · fee {target.fee_bps}bps" if target.fee_bps else ""
     await bus.emit(

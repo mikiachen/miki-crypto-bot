@@ -172,7 +172,11 @@ async def score_narrative(
             },
             {
                 "role": "user",
-                "content": f"token=${token} address={address[:12]}… chain=arc{x_ctx}",
+                "content": (
+                    f"token=${x_pulse.get('symbol') or token} "
+                    f"address={x_pulse.get('token') or address} "
+                    f"chain=arc{x_ctx}"
+                ),
             },
         ]
         data = await llm_chat_json(
