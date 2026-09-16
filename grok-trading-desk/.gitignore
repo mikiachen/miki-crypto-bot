@@ -1,0 +1,16 @@
+config.yaml
+*.jsonl
+logs/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+.DS_Store
+.idea/
+.vscode/
+.venv/
+.vendor/

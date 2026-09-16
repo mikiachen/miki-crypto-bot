@@ -1,0 +1,6 @@
+streamlit
+numpy
+pyyaml
+websockets
+httpx
+web3

@@ -1,0 +1,55 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Secrets / local desk config (never commit keys)
+.env
+.env.*
+!.env.example
+!.env.mainnet.example
+grok-trading-desk/config.yaml
+grok-trading-desk/logs/
+grok-trading-desk/.vendor/
+
+# Local binaries and recordings — not source
+/anvil
+/cast
+/forge
+.video_frames/
+.cursor/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Research artifacts (large, regenerable)
+memory.db
+*.sqlite
+runs/
+results/
+data/cache/
+*.parquet
+
+# Figures regenerate from script, but allow checked-in PNGs
+# figures/*.png
