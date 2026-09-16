@@ -45,7 +45,3 @@ Official HTTPS only. `http://niorfun.com` is not an RPC. The explorer `https://a
 The valve, the one-position rule, and the 1 USDC cap sit outside the robots. Dexscreener is read-only. A listed pair is not a buy. Tolly and DYOR stay dark until a verified mainnet swap ABI exists. Do not paste invented contract addresses.
 
 GoPlus does not support Arc chain 5042. An unsupported-chain response is not a pass and not a fake honeypot. A real honeypot flag still stops the buy.
-
-## Research lab
-
-The older research engine lives in `ai_quant_lab/`. Notes: [docs/AI_QUANT_LAB.md](docs/AI_QUANT_LAB.md). License: MIT.
