@@ -20,6 +20,7 @@ ENV/
 .env.*
 !.env.example
 !.env.mainnet.example
+!.env.rh.example
 grok-trading-desk/config.yaml
 grok-trading-desk/logs/
 grok-trading-desk/.vendor/
