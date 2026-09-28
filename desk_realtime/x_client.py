@@ -139,6 +139,241 @@ def _urlquote(s: str) -> str:
     return quote(s, safe="")
 
 
+_RESERVED_HANDLES = {
+    "home", "search", "explore", "intent", "share", "i", "hashtag", "login", "privacy",
+}
+
+
+def handle_from_url(url: str) -> str:
+    """Profile handle from a listed X URL. Tweet and intent links are ignored."""
+    from urllib.parse import urlparse
+
+    raw = (url or "").strip()
+    if raw.startswith("@") and "/" not in raw:
+        name = raw[1:]
+    else:
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        host = parsed.netloc.lower()
+        parts = [p for p in parsed.path.split("/") if p]
+        if not (host.endswith("x.com") or host.endswith("twitter.com")) or len(parts) != 1:
+            return ""
+        name = parts[0]
+    name = re.sub(r"[^A-Za-z0-9_]", "", name)
+    if not name or name.isdigit() or len(name) > 15 or name.lower() in _RESERVED_HANDLES:
+        return ""
+    return name
+
+
+def _domain(url: str) -> str:
+    from urllib.parse import urlparse
+
+    host = urlparse(url if "://" in url else f"https://{url}").netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _age_days(created_at: str) -> float | None:
+    from datetime import datetime, timezone
+
+    raw = (created_at or "").strip()
+    if not raw:
+        return None
+    try:
+        created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - created).total_seconds() / 86400.0)
+
+
+def _compact(n: int | None) -> str:
+    if n is None:
+        return "?"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _mismatch(text: str, symbol: str, address: str) -> bool:
+    """Listed account talks about a different ticker or CA, and not this one."""
+    blob = text or ""
+    sym = (symbol or "").lstrip("$").upper()
+    mentions_us = bool(sym) and (
+        f"${sym}".lower() in blob.lower() or sym.lower() in blob.lower()
+    )
+    if address and address.startswith("0x"):
+        found = re.findall(r"0x[a-fA-F0-9]{40}", blob)
+        if found and all(a.lower() != address.lower() for a in found):
+            return True
+        if any(a.lower() == address.lower() for a in found):
+            mentions_us = True
+    others = [
+        t for t in re.findall(r"\$([A-Za-z][A-Za-z0-9]{1,12})", blob)
+        if t.upper() != sym
+    ]
+    return bool(others) and not mentions_us
+
+
+async def lookup_user(username: str, *, timeout: float | None = None) -> dict[str, Any]:
+    """GET /2/users/by/username. 404 is a dead listed handle, not a guessed one."""
+    token = bearer_token()
+    name = re.sub(r"[^A-Za-z0-9_]", "", username or "")
+    if not token or not name:
+        return {"ok": False, "error": "no bearer or handle"}
+    timeout = float(timeout if timeout is not None else os.environ.get("X_SEARCH_TIMEOUT", "8"))
+    cache_key = f"user|{name.lower()}"
+    now = time.time()
+    hit = _CACHE.get(cache_key)
+    if hit and now - float(hit.get("ts") or 0) < 900:
+        out = dict(hit["data"])
+        out["cached"] = True
+        return out
+    url = (
+        f"https://api.twitter.com/2/users/by/username/{name}"
+        "?user.fields=created_at,description,public_metrics,verified,verified_type,url,entities"
+    )
+    try:
+        data = await http_json(
+            "GET",
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "miki-desk-x/1.0",
+            },
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        err = sanitize_exc(exc)
+        dead = "404" in err
+        return {"ok": False, "error": err, "dead": dead, "username": name}
+    user = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(user, dict):
+        return {"ok": False, "error": "user unread", "username": name}
+    metrics = user.get("public_metrics") if isinstance(user.get("public_metrics"), dict) else {}
+    entities = user.get("entities") if isinstance(user.get("entities"), dict) else {}
+    url_ent = entities.get("url") if isinstance(entities.get("url"), dict) else {}
+    urls = url_ent.get("urls") if isinstance(url_ent.get("urls"), list) else []
+    expanded = ""
+    if urls and isinstance(urls[0], dict):
+        expanded = str(urls[0].get("expanded_url") or urls[0].get("url") or "")
+    result = {
+        "ok": True,
+        "username": str(user.get("username") or name),
+        "name": str(user.get("name") or ""),
+        "description": str(user.get("description") or "")[:280],
+        "created_at": str(user.get("created_at") or ""),
+        "followers": int(metrics.get("followers_count") or 0),
+        "tweet_count": int(metrics.get("tweet_count") or 0),
+        "verified": bool(user.get("verified")),
+        "verified_type": str(user.get("verified_type") or ""),
+        "url": expanded or str(user.get("url") or ""),
+        "error": "",
+        "dead": False,
+        "cached": False,
+    }
+    _CACHE[cache_key] = {"ts": now, "data": result}
+    return result
+
+
+async def official_account(token: str, address: str = "") -> dict[str, Any]:
+    """
+    Credibility of the handle Dexscreener lists for this token.
+    Never searches X for a username invented from the ticker.
+    """
+    empty = {
+        "ok": False,
+        "cred": "unread",
+        "handle": "",
+        "age_days": None,
+        "followers": None,
+        "verified_type": "",
+        "site_match": None,
+        "line": "official unread",
+        "error": "",
+    }
+    if not x_api_enabled():
+        empty["cred"] = "unread"
+        empty["line"] = "official unread · X off"
+        empty["error"] = "X API disabled or no bearer"
+        return empty
+    try:
+        from desk_realtime.arc_dex import pair_links
+
+        links = await asyncio.to_thread(pair_links, address) if address.startswith("0x") else {}
+    except Exception as exc:  # noqa: BLE001
+        empty["error"] = sanitize_exc(exc)
+        empty["line"] = "official unread · links failed"
+        return empty
+    website = str((links or {}).get("website") or "")
+    handle = handle_from_url(str((links or {}).get("twitter") or ""))
+    if not handle:
+        return {
+            **empty,
+            "ok": True,
+            "cred": "none",
+            "line": "official none · no listed X",
+        }
+    user = await lookup_user(handle)
+    if not user.get("ok"):
+        if user.get("dead"):
+            return {
+                **empty,
+                "ok": True,
+                "cred": "dead",
+                "handle": handle,
+                "line": f"official dead · @{handle}",
+                "error": user.get("error") or "",
+            }
+        empty["handle"] = handle
+        empty["error"] = str(user.get("error") or "")
+        empty["line"] = f"official unread · @{handle}"
+        return empty
+    age = _age_days(str(user.get("created_at") or ""))
+    followers = int(user.get("followers") or 0)
+    vtype = str(user.get("verified_type") or "")
+    text = f"{user.get('name') or ''} {user.get('description') or ''}"
+    site_match = None
+    site_host = _domain(website)
+    acct_host = _domain(str(user.get("url") or ""))
+    if site_host and acct_host:
+        site_match = site_host == acct_host or site_host.endswith("." + acct_host) or acct_host.endswith("." + site_host)
+    mismatch = _mismatch(text, token, address)
+    bio_hit = bool(token) and token.lstrip("$").lower() in text.lower()
+    gold = vtype in ("business", "government")
+    if mismatch:
+        cred = "mismatch"
+    elif gold or (
+        age is not None and age >= 30 and followers >= 1000 and (site_match or bio_hit)
+    ):
+        cred = "high"
+    elif age is not None and age >= 7 and followers >= 200 and (bio_hit or site_match or user.get("verified")):
+        cred = "ok"
+    else:
+        cred = "thin"
+    age_s = f"{age:.0f}d" if age is not None else "?d"
+    bits = [f"official {cred}", f"@{user.get('username') or handle}", age_s, f"{_compact(followers)} followers"]
+    if gold or vtype:
+        bits.append(vtype or "verified")
+    if site_match is True:
+        bits.append("site match")
+    elif site_match is False:
+        bits.append("site mismatch")
+    return {
+        "ok": True,
+        "cred": cred,
+        "handle": str(user.get("username") or handle),
+        "age_days": None if age is None else round(age, 1),
+        "followers": followers,
+        "verified_type": vtype,
+        "site_match": site_match,
+        "line": " · ".join(bits),
+        "error": "",
+        "description": str(user.get("description") or "")[:180],
+    }
+
+
 async def narrative_x_pulse(token: str, address: str = "") -> dict[str, Any]:
     """
     Build a real-time X pulse for a meme ticker / CA snippet.

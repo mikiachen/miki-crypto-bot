@@ -26,6 +26,28 @@ if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+def _load_dotenv(path: Path) -> None:
+    """Load key=value into os.environ without overriding existing exports."""
+    if not path.is_file():
+        return
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+# Must load before desk_units so DESK_CHAIN=robinhood → USDG.
+_load_dotenv(ROOT / ".env")
+_load_dotenv(ROOT / ".env.rh")
+
 from desk_realtime.bus import DeskBus
 from desk_realtime.client import ensure_ws_client, inject_local
 from desk_realtime.fastforward import (
@@ -52,36 +74,20 @@ from desk_realtime.schema import stage_packets
 # Local forge/cast (project root) on PATH for Arc RPC tooling
 ensure_foundry_on_path()
 
-# Optional: load ARC_PRIVATE_KEY etc. from project .env (never log secrets)
-try:
-    from pathlib import Path as _P
-
-    _env = ROOT / ".env"
-    if _env.is_file():
-        for _line in _env.read_text(encoding="utf-8", errors="ignore").splitlines():
-            _line = _line.strip()
-            if not _line or _line.startswith("#") or "=" not in _line:
-                continue
-            _k, _, _v = _line.partition("=")
-            _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
-            if _k and _k not in os.environ:
-                os.environ[_k] = _v
-except Exception:
-    pass
-
 LOG = ROOT / "grok-trading-desk" / "logs" / "desk.jsonl"
 HALT_FLAG = ROOT / "grok-trading-desk" / "logs" / "desk.halt"
 DEPLOY_FLAG = ROOT / "grok-trading-desk" / "logs" / "desk.deploy"
 AVATARS = ROOT / "assets" / "avatars"
 SESSION = 8 * 3600
-# Quote asset: Arc = native USDC (STAKE/ENTRY from desk_units); Solana fallback = SOL
+# Quote: Arc USDC · RH USDG · Solana SOL
 DESK_PAPER = os.environ.get("DESK_PAPER", "auto")
 DESK_WS_URL = os.environ.get("DESK_WS_URL", "ws://127.0.0.1:8765")
 DESK_FF = is_fastforward()
 RUN_KEY = f"{QUOTE.lower()}{STAKE:g}_8h_ff_v3" if DESK_FF else f"{QUOTE.lower()}{STAKE:g}_8h_v3"
-_FRAGMENT_KW: dict = {"run_every": 0.55} if DESK_FF else {"run_every": 1}
+_FRAGMENT_KW: dict = {"run_every": 0.55} if DESK_FF else {"run_every": 2.5}
+_IS_RH = DESK_CHAIN in ("robinhood", "rh", "rhchain")
 
-# Back-compat aliases (values are USDC on Arc)
+# Back-compat aliases
 fmt_sol = fmt_quote
 fmt_sol_html = fmt_quote_html
 
@@ -99,6 +105,16 @@ def avatar_data_uri(stem: str) -> str:
 def arc_mark_data_uri() -> str:
     """Official Arc mark for network badge (does not replace miki brand)."""
     path = ROOT / "assets" / "arc-mark.png"
+    if not path.exists():
+        return ""
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+@lru_cache(maxsize=1)
+def rh_mark_data_uri() -> str:
+    """Robinhood Chain mark for network badge (RH desk)."""
+    path = ROOT / "assets" / "rh-mark.png"
     if not path.exists():
         return ""
     b64 = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -130,6 +146,51 @@ def arc_network_label() -> tuple[str, str]:
     if cid and cid != 5042002:
         return "mainnet", f"Arc Network · chain {cid}"
     return "testnet", "Arc Network"
+
+
+def rh_network_label() -> tuple[str, str]:
+    try:
+        cid = int(os.environ.get("RH_CHAIN_ID") or CHAIN_ID or "4663")
+    except ValueError:
+        cid = 4663
+    return "mainnet", f"Robinhood Chain · {cid}"
+
+
+def desk_intel_line() -> str:
+    """One-line pump + RHC intel for RH desk (read-only)."""
+    if not _IS_RH:
+        return ""
+    bits: list[str] = []
+    try:
+        from desk_realtime.pump_intel import theme_line as pump_line
+
+        pl = pump_line()
+        if pl and "unread" not in pl:
+            bits.append(pl)
+    except Exception:
+        pass
+    try:
+        from desk_realtime.rhc_intel import theme_line as rhc_line
+
+        rl = rhc_line()
+        if rl and "unread" not in rl:
+            bits.append(rl)
+    except Exception:
+        pass
+    if not bits:
+        try:
+            from desk_realtime.engine_state import read_engine_state
+
+            eng = read_engine_state()
+            hot = eng.get("rhc_hot") or []
+            if hot:
+                bits.append("rhc · " + " · ".join(str(x) for x in hot[:3] if x))
+            themes = eng.get("pump_themes") or []
+            if themes:
+                bits.append("pump · " + " · ".join(str(x) for x in themes[:3] if x))
+        except Exception:
+            pass
+    return " · ".join(bits) if bits else "intel · pump+rhc read-only"
 _MIKI_ICON = ROOT / "assets" / "miki-cyber-mark.png"
 st.set_page_config(
     page_title="miki crypto bot · grok trencher",
@@ -587,7 +648,17 @@ html[data-theme="day"] .topbar .logo,
 .desk[data-theme="day"] .topbar .logo{
   background:#111;border-color:#50A88E;
 }
+.topbar .logo.is-rh{
+  background:#CCFF00;border:none;border-radius:50%;
+  box-shadow:none;outline:none;
+}
+.topbar .logo.is-rh img{
+  object-fit:cover;border-radius:50%;
+}
 .topbar .title{color:#ffffff;font-weight:700;font-size:var(--fs-lg);letter-spacing:.01em;white-space:nowrap;}
+html[data-theme="day"] .topbar .title.is-rh,
+.desk[data-theme="day"] .topbar .title.is-rh{color:#111111;}
+.topbar .title.is-rh{color:#e8ffe8;}
 .topbar .net-badge{
   display:inline-flex;align-items:center;gap:8px;flex-shrink:0;
   margin-left:14px;margin-right:4px;
@@ -1176,6 +1247,14 @@ div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"]) button{
   gap:1.5px;width:100%;min-height:16px;padding:0 2px 0 4px;
   box-sizing:border-box;
 }
+.outcome-row .ob-track.sync{
+  justify-content:stretch;
+  gap:4px;
+  padding:0 4px 0 4px;
+}
+.outcome-row .ob-track.sync .ob{
+  flex:1 1 0;min-width:8px;max-width:none;
+}
 .ob{
   flex:1 1 0;min-width:2px;max-width:5px;
   display:block;border-radius:1px 1px 0 0;
@@ -1322,7 +1401,7 @@ html[data-theme="day"] .sig-module .sig-wave > i,
 /* THE BALANCE live endpoint + axes */
 .bal-chart{
   position:relative;width:100%;height:100%;flex:1;min-height:0;
-  display:grid;grid-template-columns:42px minmax(0,1fr);grid-template-rows:minmax(0,1fr) 16px;
+  display:grid;grid-template-columns:42px minmax(0,1fr);grid-template-rows:minmax(0,1fr) 16px auto;
   gap:2px 6px;box-sizing:border-box;
 }
 .bal-y{
@@ -1331,14 +1410,54 @@ html[data-theme="day"] .sig-module .sig-wave > i,
   font-family:'IBM Plex Mono','Courier New',monospace;font-size:12px;line-height:1;
   color:rgba(255,255,255,.4);letter-spacing:.02em;user-select:none;
 }
-.bal-plot{grid-column:2;grid-row:1;position:relative;min-width:0;min-height:0;display:flex;}
+.bal-plot{grid-column:2;grid-row:1;position:relative;min-width:0;min-height:0;display:flex;overflow:hidden;cursor:crosshair;}
 .bal-plot > svg{width:100%;height:100%;display:block;}
 .bal-x{
-  grid-column:2;grid-row:2;display:flex;justify-content:space-between;align-items:center;
+  grid-column:2;grid-row:2;display:block;overflow:hidden;
   padding:0 2px;box-sizing:border-box;
   font-family:'IBM Plex Mono','Courier New',monospace;font-size:12px;line-height:1;
   color:rgba(255,255,255,.4);letter-spacing:.02em;user-select:none;
 }
+.bal-x-in{
+  display:flex;justify-content:space-between;align-items:center;
+  width:100%;height:100%;transform-origin:left center;
+}
+.bal-bars{
+  grid-column:2;grid-row:3;min-height:16px;width:100%;overflow:hidden;
+  box-sizing:border-box;padding:0 2px 0 4px;
+}
+.bal-bars-fill{
+  height:100%;max-width:100%;box-sizing:border-box;
+}
+.bal-bars-fill .ob-track{width:100%;}
+.bal-bars .ob-track{
+  display:flex;align-items:flex-end;justify-content:flex-start;
+  gap:1.5px;width:100%;min-height:16px;box-sizing:border-box;
+  transform-origin:left bottom;
+}
+.bal-bars .ob-track.sync{
+  justify-content:stretch;gap:4px;
+}
+.bal-bars .ob-track.sync .ob{
+  flex:1 1 0;min-width:8px;max-width:none;
+}
+.bal-mode-row{
+  display:inline-flex;gap:6px;align-items:center;margin-left:8px;
+  font-size:var(--fs-2xs);letter-spacing:.04em;
+}
+.bal-mode-row a{
+  color:var(--muted);text-decoration:none;border-bottom:1px solid transparent;
+  opacity:.75;
+}
+.bal-mode-row a.on{
+  color:var(--green);opacity:1;border-bottom-color:var(--green);
+}
+[data-testid="stCustomComponentV1"]{
+  height:0!important;min-height:0!important;margin:0!important;padding:0!important;
+  overflow:hidden!important;border:0!important;
+}
+.outcome-row{overflow:hidden;}
+.outcome-row .ob-track.sync{transform-origin:left bottom;}
 .bal-badge-wrap{
   position:absolute;z-index:2;pointer-events:none;
   transform:translate(-50%,calc(-100% - 10px));
@@ -1785,6 +1904,29 @@ html[data-theme="day"] .ac-sub,
 .sz-stats .val.g{color:#5EEAD4;}
 .sz-stats .val.r{color:#FF6B7A;}
 
+/* RH text panels — column stack, no SVG overlay chrome */
+.wc-body.rh-text,.sz-body.rh-text{
+  display:flex;flex-direction:column;justify-content:center;gap:8px;
+  min-height:0;overflow:hidden;padding:2px 0 4px;
+}
+.rh-kicker{
+  color:var(--hi,#e8ffe8);font-size:var(--fs-sm);font-weight:700;letter-spacing:.04em;
+  line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.rh-line{
+  color:var(--muted,#6a8a6a);font-size:var(--fs-xs);line-height:1.35;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.rh-meta{
+  display:flex;flex-wrap:wrap;gap:10px 14px;align-items:baseline;
+  color:#6a7a6a;font-size:var(--fs-2xs);letter-spacing:.03em;
+}
+.rh-meta b{color:#7CFF9A;font-weight:700;font-size:var(--fs-sm);}
+.rh-meta b.warn{color:#FFB86C;}
+.rh-meta b.bad{color:#FF6B7A;}
+.sz-panel .sz-body.rh-text{grid-row:3;}
+.sz-panel .sz-stats.rh-stats{margin-top:0;}
+
 /* Manifold / embedding — HTML titles left-aligned like other panels */
 .mf-panel,.emb-panel{
   display:grid;grid-template-rows:auto auto minmax(0,1fr) auto;gap:0;
@@ -1935,17 +2077,18 @@ def resolve_desk_theme(ss) -> str:
 
 
 def inject_theme_vars(theme: str) -> None:
-    """Re-apply :root tokens each fragment so body + desk switch together."""
+    """Re-apply :root tokens each fragment — module CSS defaults to night :root."""
     if theme == "day":
         block = """
 <style>
-:root{
+:root, html{
   --app-bg:#F5F7F9;--glass-bg:#FFFFFF;--glass-border:1px solid #E0E0E0;
   --glass-blur:blur(8px);--glass-shadow:0 1px 2px rgba(20,30,40,.04),0 8px 20px rgba(20,30,40,.05);
   --line:rgba(20,30,40,.14);--muted:#4A4A4A;--text:#1A1A1A;--hi:#111111;
   --green:#137333;--red:#C5221F;--yellow:#B06000;--blue:#1967D2;
   --topbar-bg:#FFFFFF;--topbar-border:#E0E0E0;
   --kv-bg:#F7F8FA;--kv-border:#DADCE0;--live:#137333;
+  --theme-label:DAY;
 }
 html,body,[data-testid="stAppViewContainer"],.stApp,.main{background:var(--app-bg)!important;color:var(--text)!important;}
 </style>
@@ -1953,13 +2096,14 @@ html,body,[data-testid="stAppViewContainer"],.stApp,.main{background:var(--app-b
     else:
         block = """
 <style>
-:root{
+:root, html{
   --app-bg:#000000;--glass-bg:#0a0d14;--glass-border:1px solid #1e2530;
   --glass-blur:blur(16px);--glass-shadow:0 8px 32px 0 rgba(0,0,0,.37);
   --line:rgba(255,255,255,.06);--muted:#6a8a6a;--text:#c8ffd8;--hi:#e8ffe8;
   --green:#00ff66;--red:#ff3d6e;--yellow:#ffcc33;--blue:#4da3ff;
   --topbar-bg:#000000;--topbar-border:rgba(255,255,255,.1);
   --kv-bg:rgba(255,255,255,.02);--kv-border:rgba(255,255,255,.05);--live:#52ff8c;
+  --theme-label:NIGHT;
 }
 html,body,[data-testid="stAppViewContainer"],.stApp,.main{background:var(--app-bg)!important;color:var(--text)!important;}
 </style>
@@ -2393,6 +2537,92 @@ def mark_to_market(position: dict | None, tick: int) -> dict | None:
     return out
 
 
+def _logged_mark(row: dict) -> tuple[float | None, float | None, str]:
+    """Mark the loop already wrote. Score is not a price."""
+    d = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+    note = str(d.get("note") or row.get("reason") or "")
+    mult = d.get("mult")
+    mark_usdc = d.get("mark_usdc")
+    if mult is None:
+        found = re.search(r"([0-9]+(?:\.[0-9]+)?)x mark", note)
+        if found:
+            mult = found.group(1)
+    if not mark_usdc:
+        found = re.search(r"· \$([0-9]+(?:\.[0-9]+)?)", note)
+        if found:
+            mark_usdc = found.group(1)
+    try:
+        mult_f = float(mult) if mult is not None else None
+    except (TypeError, ValueError):
+        mult_f = None
+    try:
+        value_f = float(mark_usdc) if mark_usdc else None
+    except (TypeError, ValueError):
+        value_f = None
+    return mult_f, value_f, str(d.get("mark_src") or "")
+
+
+def _failed_exit_row(row: dict) -> bool:
+    detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+    note = str(detail.get("note") or "")
+    return note.startswith("ERROR") or "exit rpc failed" in note or "sell failed" in note
+
+
+def _rh_positions_from_engine() -> tuple[list[dict] | None, int]:
+    """RH open book from rh_loop engine_state (source of truth).
+
+    Returns (positions, max_slots). positions=None means engine unread → keep
+    jsonl fallback. positions=[] means genuinely flat.
+    """
+    try:
+        from desk_realtime.engine_state import read_engine_state
+
+        eng = read_engine_state()
+    except Exception:
+        return None, 2
+    if not isinstance(eng, dict) or not eng:
+        return None, 2
+    if "open_book" not in eng and "slots_open" not in eng:
+        return None, 2
+    try:
+        max_slots = max(1, int(eng.get("max_slots") or os.environ.get("RH_MAX_SLOTS") or 2))
+    except (TypeError, ValueError):
+        max_slots = 2
+    out: list[dict] = []
+    for p in eng.get("open_book") or []:
+        if not isinstance(p, dict):
+            continue
+        sym = str(p.get("symbol") or "").strip()
+        if not sym:
+            continue
+        try:
+            entry = float(p.get("entry_usdg") or ENTRY)
+        except (TypeError, ValueError):
+            entry = float(ENTRY)
+        try:
+            mult = float(p.get("live_mult") or 1.0)
+        except (TypeError, ValueError):
+            mult = 1.0
+        if mult <= 0:
+            mult = 1.0
+        out.append({
+            "token": f"${sym}",
+            "market": "crypto",
+            "entry": entry,
+            "base_mult": round(mult, 4),
+            "mult": round(mult, 3),
+            "value": round(entry * mult, 4),
+            "score": 0.0,
+            "mark_src": "engine_book",
+            "token_address": str(p.get("token_address") or ""),
+            "agents": {},
+            "unit": QUOTE,
+            "opened_at": p.get("opened_at"),
+        })
+    out.sort(key=lambda x: float(x.get("mult") or 1.0))
+    return out, max_slots
+
+
 def desk_state(rows: list[dict], tick: int = 0) -> dict:
     buys = [r for r in rows if r.get("type") == "buy"]
     skips = [r for r in rows if r.get("type") == "skip"]
@@ -2408,35 +2638,93 @@ def desk_state(rows: list[dict], tick: int = 0) -> dict:
     outcomes = ["w" if float(r.get("pnl", 0) or 0) > 0 else "l" for r in closes[-48:]]
     vol = [max(4, min(18, abs(float(r.get("pnl", 0) or 0)) * 40)) for r in closes[-48:]]
 
-    closed = {(r.get("market"), r.get("symbol")) for r in closes}
+    closed = set()
+    for r in closes:
+        if _failed_exit_row(r):
+            continue
+        closed.add((r.get("market"), r.get("symbol")))
     position = None
     last_exit = None
     for c in reversed(closes):
         d = c.get("detail") or {}
-        if isinstance(d, dict) and d.get("event") == "EXIT":
+        if isinstance(d, dict) and d.get("event") == "EXIT" and not _failed_exit_row(c):
             last_exit = {"token": f"${c.get('symbol')}", "mult": float(d.get("mult", 1)),
                          "pnl": float(c.get("pnl", 0) or 0)}
             break
+    open_rows: list[dict] = []
+    seen_open: set[tuple] = set()
     for b in reversed(buys):
         key = (b.get("market"), b.get("symbol"))
-        if key in closed:
+        if key in closed or key in seen_open or not b.get("symbol"):
             continue
+        seen_open.add(key)
+        open_rows.append(b)
+    slot_cap = 2
+    try:
+        if _IS_RH:
+            slot_cap = max(1, int(os.environ.get("RH_MAX_SLOTS") or "2"))
+        else:
+            slot_cap = max(1, min(2, int(os.environ.get("ARC_MAX_SLOTS") or "2")))
+    except ValueError:
+        slot_cap = 2
+    built: list[dict] = []
+    for b in open_rows:
         amt = normalize_fill_amount(b.get("amount", ENTRY))
         score = float(b.get("score", 0.75) or 0.75)
-        base_mult = max(1.0, score * 10 + random.Random(str(b.get("ts"))).uniform(0, 18))
-        position = {
+        # Live book: the loop already emits the mark ("HOLD · 1.00x mark").
+        # Do not invent score*10 + random — that is not a price, not leverage.
+        logged_mult, logged_value, mark_src = _logged_mark(b)
+        if logged_mult is not None and logged_mult > 0:
+            base_mult = logged_mult
+            value = logged_value if logged_value and logged_value > 0 else amt * logged_mult
+        elif DESK_FF:
+            base_mult = max(1.0, score * 10 + random.Random(str(b.get("ts"))).uniform(0, 18))
+            value = amt * base_mult
+        else:
+            base_mult = 1.0
+            value = amt
+        built.append({
             "token": f"${b.get('symbol')}", "market": b.get("market"), "entry": amt,
             "base_mult": round(base_mult, 2),
-            "mult": round(base_mult, 1), "value": round(amt * base_mult, 4), "score": score,
+            "mult": round(base_mult, 1), "value": round(value, 4), "score": score,
+            "mark_src": mark_src,
             "agents": b.get("all_agent_scores") or {},
             "unit": QUOTE,
-        }
-        break
+        })
 
-    position = mark_to_market(position, tick)
+    # RH: engine open_book wins over jsonl buy/close reconstruction.
+    if _IS_RH and not DESK_FF:
+        eng_built, eng_slots = _rh_positions_from_engine()
+        if eng_built is not None:
+            built = eng_built
+            slot_cap = eng_slots
+
+    if built and not DESK_FF:
+        built.sort(key=lambda p: float(p.get("mult") or 1.0))
+        marked: list[dict] = []
+        for p in built:
+            m = mark_to_market(p, tick)
+            if m:
+                marked.append(m)
+        built = marked
+        position = built[0] if built else None
+        if position:
+            others = [p["token"] for p in built[1:]]
+            n = len(built)
+            position["size_note"] = (
+                f"{n} of {slot_cap} slots"
+                + (f" · also {others[0]}" if others else "")
+            )
+    elif built:
+        position = built[0]
+        position = mark_to_market(position, tick)
+    else:
+        position = None
 
     unreal = 0.0
-    if position:
+    if built and not DESK_FF:
+        unreal = sum(float(p.get("value") or 0) - float(p.get("entry") or 0) for p in built)
+    elif position:
         unreal = float(position["value"]) - float(position["entry"])
     balance = max(0.0, principal + pnl + unreal)
     multiple = (balance / principal) if principal else 1.0
@@ -2902,6 +3190,7 @@ def svg_area_line(
     progress: float = 1.0,
     theme: str = "night",
     money_axis: bool = False,
+    bars_html: str | None = None,
 ) -> str:
     """Balance equity curve: starts at principal, green↑ / red↓ waves, endpoint = last (quote)."""
     if not vals:
@@ -3014,12 +3303,23 @@ def svg_area_line(
     xl = x_labels or ("00:00", "04:00", "08:00")
     y_html = "".join(f'<span>{t}</span>' for t in reversed(y_tick_lbl))
     x_html = "".join(f'<span>{t}</span>' for t in xl)
+    # Bars must share the curve's revealed width (RT: 00:00→NOW, not full 24:00).
+    p_bar = float(np.clip(progress, 0.04, 1.0)) * 100.0
+    bars_block = ""
+    if bars_html:
+        bars_block = (
+            f'<div class="bal-bars">'
+            f'<div class="bal-bars-fill" style="width:{p_bar:.2f}%">{bars_html}</div>'
+            f"</div>"
+        )
 
     return (
         f'<div class="bal-chart">'
         f'<div class="bal-y">{y_html}</div>'
         f'<div class="bal-plot">'
         f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" '
+        f'data-ymin="{float(plot_min):.6f}" data-ymax="{float(plot_max):.6f}" '
+        f'data-padt="{pad_t}" data-padb="{pad_b}" '
         f'xmlns="http://www.w3.org/2000/svg">'
         f"<defs>"
         f'<linearGradient id="{gid}" x1="0" y1="0" x2="0" y2="1">'
@@ -3043,8 +3343,9 @@ def svg_area_line(
         f'<div class="{badge_cls}">{badge_html}</div>'
         f"</div>"
         f"</div>"
-        f'<div class="bal-x">{x_html}</div>'
-        f"</div>"
+        f'<div class="bal-x"><div class="bal-x-in">{x_html}</div></div>'
+        + bars_block
+        + f"</div>"
     )
 
 
@@ -3101,7 +3402,15 @@ def svg_manifold(phase: float, w: int = 420, h: int = 148) -> str:
     )
 
 
-def svg_embed(seed: int, accepted: int, rejected: int, w: int = 420, h: int = 148) -> str:
+def svg_embed(
+    seed: int,
+    accepted: int,
+    rejected: int,
+    w: int = 420,
+    h: int = 148,
+    *,
+    cluster_label: str = "ROBINHOOD CLUSTER",
+) -> str:
     rng = np.random.default_rng(seed)
     n, m = max(40, min(100, rejected // 4 + 30)), max(10, min(42, accepted * 4 + 8))
     # rejected brown cluster (lower-left)
@@ -3137,7 +3446,7 @@ def svg_embed(seed: int, accepted: int, rejected: int, w: int = 420, h: int = 14
         + f'<circle cx="{acx:.1f}" cy="{acy:.1f}" r="{cr:.1f}" fill="none" stroke="#e8ffe8" '
         f'stroke-width="1.25" opacity="0.7"/>'
         f'<text x="{label_x:.1f}" y="{label_y:.1f}" fill="#7CFF9A" font-size="12" '
-        f'font-family="IBM Plex Mono,monospace" letter-spacing="1.2">ROBINHOOD CLUSTER</text>'
+        f'font-family="IBM Plex Mono,monospace" letter-spacing="1.2">{cluster_label}</text>'
         + "</svg>"
     )
 
@@ -3213,24 +3522,36 @@ def svg_survival(ruin: float, kelly: float, w: int = 420, h: int = 110) -> str:
     )
 
 
-def volume_bars(hist: list[float], n: int = 56) -> str:
-    """Volatility ticks under THE BALANCE — green=up, red=down, left-aligned to plot."""
-    arr = list(hist[-n:] if hist else [STAKE])
+def volume_bars(hist: list[float], n: int = 56, *, match_curve: bool = False) -> str:
+    """Volatility ticks under THE BALANCE — green=up, red=down.
+
+    match_curve=True: one bar per curve sample (日线 sync), full-width track.
+    Default: pad to n for the dense paper/demo strip.
+    """
+    arr = list(hist) if hist else [float(STAKE)]
     if len(arr) < 2:
-        arr = [STAKE, float(arr[-1] if arr else STAKE)]
-    # pad so track always feels dense like the reference
-    while len(arr) < n:
-        arr = [arr[0]] + arr
-    arr = arr[-n:]
+        arr = [float(arr[0] if arr else STAKE), float(arr[-1] if arr else STAKE)]
+    if match_curve:
+        # Keep curve length — do not invent 56 padded ticks.
+        arr = [float(v) for v in arr]
+    else:
+        while len(arr) < n:
+            arr = [arr[0]] + arr
+        arr = arr[-n:]
     parts = []
     for i, v in enumerate(arr):
         prev = arr[i - 1] if i else v
         delta = float(v) - float(prev)
         mag = abs(delta)
-        hh = max(4, min(18, int(4 + mag * 14)))
+        if match_curve:
+            # Day-scale: small PnL still readable; flat day stays a hairline.
+            hh = max(6, min(18, int(6 + mag * 40))) if mag > 1e-9 else 5
+        else:
+            hh = max(4, min(18, int(4 + mag * 14)))
         cls = "up" if delta >= 0 else "dn"
         parts.append(f'<i class="ob {cls}" style="height:{hh}px"></i>')
-    return f'<div class="ob-track">{"".join(parts)}</div>'
+    track_cls = "ob-track sync" if match_curve else "ob-track"
+    return f'<div class="{track_cls}">{"".join(parts)}</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -3324,7 +3645,7 @@ def update_panel_state(ev: dict, position: dict | None = None) -> dict:
             "value_cls": "dim",
         }
     if state == "BUY":
-        mult = float((position or {}).get("mult") or ev.get("mult") or 2.6)
+        mult = float((position or {}).get("mult") or ev.get("mult") or 1.0)
         entry = float((position or {}).get("entry") or amt)
         value = float((position or {}).get("value") or (entry * mult))
         return {
@@ -3334,6 +3655,7 @@ def update_panel_state(ev: dict, position: dict | None = None) -> dict:
             "entry": fmt_quote_html(entry, 2),
             "value": fmt_quote_html(value, 2),
             "value_cls": "",
+            "size_note": (position or {}).get("size_note") or "",
         }
     if state == "ARMING":
         entry = float((position or {}).get("entry") or amt)
@@ -3431,7 +3753,11 @@ def expand_log_record(r: dict) -> list[dict]:
             note = d.get("note") or r.get("reason") or f"SCORE ${sym}"
             push("score", str(note), agent or "NARRATIVE", panel=panel_force or "VOTING")
         elif act == "SCAN" or d.get("event") == "SCAN":
-            push("scan", f"SCAN fresh launch ${sym}", "SCANNER")
+            note = d.get("note") or r.get("reason") or ""
+            if note:
+                push("scan", f"SCAN ${sym} · {note}", agent or "SCANNER")
+            else:
+                push("scan", f"SCAN ${sym}", agent or "SCANNER")
         elif act == "ARM" or d.get("event") == "BOOT":
             push("scan", f"ARM ${sym} · {r.get('reason')}", agent or "EXIT",
                  panel=panel_force or "HOLD_OFF")
@@ -3546,7 +3872,7 @@ def render_pos_panel(payload: dict, link_status: str = "connected") -> str:
         f'<div class="pos-row"><span class="k">value</span>'
         f'<span class="{v_cls}">{value}</span></div>'
         f'<div class="pos-row"><span class="k">size</span>'
-        f'<span class="v dim">one position at a time</span></div>'
+        f'<span class="v dim">{payload.get("size_note") or "one position at a time"}</span></div>'
         f'</div>'
         f'<div class="pos-foot"><div class="{bar_cls}">{bar_label}</div></div>'
         f'</div>'
@@ -3723,11 +4049,30 @@ def trencher() -> None:
     if feed_ff not in ("all", "entries", "skipped", "errors"):
         feed_ff = "all"
     feed_ff_cls = f"feed-card ff-{feed_ff}"
+    # THE BALANCE: 1D=日线 from funding · RT=实时 denser tape (Dexscreener-like).
+    try:
+        bal_mode = str(st.query_params.get("bal", "") or "").lower()
+    except Exception:
+        bal_mode = ""
+    # Compat with older TIME/TICK links.
+    if bal_mode in ("time", "1d", "d", "day", "daily"):
+        bal_mode = "1d"
+    elif bal_mode in ("tick", "rt", "live", "realtime", "real"):
+        bal_mode = "rt"
+    else:
+        bal_mode = str(ss.get("bal_mode") or "1d").lower()
+        if bal_mode in ("time",):
+            bal_mode = "1d"
+        elif bal_mode in ("tick",):
+            bal_mode = "rt"
+        if bal_mode not in ("1d", "rt"):
+            bal_mode = "1d"
+    ss["bal_mode"] = bal_mode
 
-    # Paper noise is demo-only. Arc live never invents fills when the socket blips.
+    # Paper noise is demo-only. Live Arc/RH never invents fills when the socket blips.
     use_paper = (
         (not DESK_FF)
-        and DESK_CHAIN != "arc"
+        and DESK_CHAIN not in ("arc", "robinhood", "rh", "rhchain")
         and (
             DESK_PAPER == "1"
             or (DESK_PAPER == "auto" and link != "connected" and live_n == 0)
@@ -3752,10 +4097,68 @@ def trencher() -> None:
         now_local = live_now()
         progress = day_progress(now_local)
         clock_face = now_local.strftime("%H:%M:%S")
-        clock_sub = now_local.strftime("%Y-%m-%d") + " · LOCAL 24H"
+        clock_sub = now_local.strftime("%Y-%m-%d") + " · LOCAL"
         span_tag = "24H"
         clock_axis = ("00:00", "12:00", "24:00")
-        footer_time = f"{clock_face} · {now_local.strftime('%Y-%m-%d')}"
+        footer_time = ""
+    # RH THE BALANCE: day-count from funding epoch (not calendar 00:00→24:00).
+    if _IS_RH and not DESK_FF and now_local is not None:
+        try:
+            from desk_realtime.rh_net import funding_mark as _rh_fund_axis
+
+            _fm = _rh_fund_axis(float(ss.get("rh_usdg") or 0.0) or None)
+            _fa = float(_fm.get("funded_at") or 0.0)
+            if _fa > 0:
+                _fund_dt = datetime.fromtimestamp(_fa).astimezone()
+                # Calendar day index from funding date (D1 = fund day).
+                _dn = 1 + max(0, (now_local.date() - _fund_dt.date()).days)
+                _bal = str(ss.get("bal_mode") or "1d")
+                if _bal == "rt":
+                    # RT = dense equity from funding → NOW (full session, not calendar today).
+                    span_tag = "RT"
+                    _d0 = _fund_dt.strftime("%m-%d")
+                    _d1 = now_local.strftime("%m-%d")
+                    if _dn <= 1:
+                        clock_axis = (
+                            _fund_dt.strftime("%H:%M"),
+                            "·",
+                            "NOW",
+                        )
+                    elif _dn == 2:
+                        clock_axis = (_d0, _d1, "NOW")
+                    else:
+                        _mid = _fund_dt.date().toordinal() + (_dn - 1) // 2
+                        from datetime import date as _date_cls
+
+                        _dm = _date_cls.fromordinal(_mid).strftime("%m-%d")
+                        clock_axis = (_d0, _dm, "NOW")
+                    progress = 1.0
+                    clock_sub = (
+                        _fund_dt.strftime("%m-%d %H:%M")
+                        + f" FUND → NOW · {_dn}D · RT"
+                    )
+                else:
+                    # 1D = one point per calendar day since funding.
+                    span_tag = "1D"
+                    _d0 = _fund_dt.strftime("%m-%d")
+                    _d1 = now_local.strftime("%m-%d")
+                    if _dn <= 1:
+                        clock_axis = (_d0, "·", "NOW")
+                    elif _dn == 2:
+                        clock_axis = (_d0, _d1, "NOW")
+                    else:
+                        _mid = _fund_dt.date().toordinal() + (_dn - 1) // 2
+                        from datetime import date as _date_cls
+
+                        _dm = _date_cls.fromordinal(_mid).strftime("%m-%d")
+                        clock_axis = (_d0, _dm, "NOW")
+                    progress = 1.0
+                    clock_sub = (
+                        _fund_dt.strftime("%m-%d %H:%M")
+                        + f" FUND · {_dn}D · 1D"
+                    )
+        except Exception:
+            pass
     # Rebuild path from trades — X maps 0→1 across the 8h window
     ss.hist = equity_path(rows, target, n=72, progress=progress)
 
@@ -3772,7 +4175,12 @@ def trencher() -> None:
     ss.grid = grid
 
     up = state["multiple"] >= 1
-    if state["position"]:
+    if _IS_RH and not DESK_FF:
+        if state["position"]:
+            phase, blurb = f"05 {state['position']['token']}", "hold · stop · take · max-hold"
+        else:
+            phase, blurb = "01 SCAN", "RH allowlist · uni-v3"
+    elif state["position"]:
         phase, blurb = f"05 {state['position']['token']}", "vote · veto · entry · exit"
     elif state["last_exit"] and state["last_exit"]["mult"] >= 5:
         phase, blurb = "06 ROTATION", "profit into related launches"
@@ -3826,21 +4234,35 @@ def trencher() -> None:
         return f'<div class="{cls}">{txt}</div>'
 
     goplus_foot = "goplus pending"
-    try:
-        from desk_realtime.arc_goplus import read_scan
+    if _IS_RH and not DESK_FF:
+        goplus_foot = "intel-only"
+        try:
+            from desk_realtime.rhc_intel import read_intel as _rhc_read
 
-        _gp = read_scan()
-        if _gp.get("honeypot"):
-            goplus_foot = "honeypot 100%"
-            state["risk"] = 100
-        elif _gp.get("line"):
-            src = "open" if str(_gp.get("is_open_source")) == "1" else "closed" if str(_gp.get("is_open_source")) == "0" else "n/a"
-            holders = _gp.get("holder_count") or "—"
-            goplus_foot = f"src {src} · holders {holders}"
-        else:
+            _rhc = _rhc_read()
+            hot_n = len(_rhc.get("hot") or [])
+            if _rhc.get("ok") and hot_n:
+                goplus_foot = f"rhc hot {hot_n}"
+            elif _rhc.get("reason"):
+                goplus_foot = "rhc " + str(_rhc.get("reason") or "")[:28]
+        except Exception:
+            goplus_foot = "rhc unread"
+    else:
+        try:
+            from desk_realtime.arc_goplus import read_scan
+
+            _gp = read_scan()
+            if _gp.get("honeypot"):
+                goplus_foot = "honeypot 100%"
+                state["risk"] = 100
+            elif _gp.get("line"):
+                src = "open" if str(_gp.get("is_open_source")) == "1" else "closed" if str(_gp.get("is_open_source")) == "0" else "n/a"
+                holders = _gp.get("holder_count") or "—"
+                goplus_foot = f"src {src} · holders {holders}"
+            else:
+                goplus_foot = "goplus unread"
+        except Exception:
             goplus_foot = "goplus unread"
-    except Exception:
-        goplus_foot = "goplus unread"
     scan_seen = int(state["launches"])
     try:
         from desk_realtime.engine_state import read_engine_state
@@ -3857,6 +4279,18 @@ def trencher() -> None:
         ("TIMING", "#7B1FA2" if theme == "day" else "#c77dff", "circle", "bars", "FLOW", f"liq {state['liq']}%"),
         ("EXIT", "#137333" if theme == "day" else "#00ff66", "hex", "grid", "EXIT", "exit lane"),
     ]
+    if _IS_RH and not DESK_FF:
+        _rh_hot = len(_eng_early.get("rhc_hot") or []) if _eng_early else 0
+        _rh_skips = int(_eng_early.get("not_buy") or _eng_early.get("net_out") or state.get("not_buy") or 0)
+        _rh_slots = int(_eng_early.get("slots_open") or 0)
+        _rh_max = int(_eng_early.get("max_slots") or 1)
+        specs = [
+            ("SCANNER", "#1967D2" if theme == "day" else "#7aaaff", "circle", "line", "SCAN", f"board {scan_seen}"),
+            ("NARRATIVE", "#B06000" if theme == "day" else "#ffcc33", "triangle", "flow", "INTEL", f"rhc { _rh_hot}"),
+            ("RISK", "#C5221F" if theme == "day" else "#ff3d6e", "square", "fills", "VETO", f"skip {_rh_skips}"),
+            ("TIMING", "#7B1FA2" if theme == "day" else "#c77dff", "circle", "bars", "M5M15", "gate"),
+            ("EXIT", "#137333" if theme == "day" else "#00ff66", "hex", "grid", "BOOK", f"{_rh_slots}/{_rh_max}"),
+        ]
     agents_parts = []
     screen_data = {
         "narr": state["narr"],
@@ -4028,6 +4462,47 @@ def trencher() -> None:
             "<span class='star'>·</span>"
             "</div>"
         )
+    intel_line = desk_intel_line() if _IS_RH and not DESK_FF else ""
+    if intel_line and not pin:
+        feed_pin_html = (
+            f"<div class='feed-pin' data-cat='scan'>"
+            f"<span class='ts'>intel</span>"
+            f"<span class='tag t-dim'>RHC</span>"
+            f"<span class='msg'>{_esc(intel_line)}</span>"
+            f"<span class='star'>·</span>"
+            f"</div>"
+        )
+    agents_ph = (
+        "SCANNER · NARRATIVE · RISK · TIMING · EXIT"
+        if not _IS_RH
+        else "BOARD · PUMP INTEL · RHC INTEL · TIMING · EXIT"
+    )
+    scan_sub = (
+        f"{scan_seen} launches seen · {goplus_foot}"
+        if not _IS_RH
+        else f"RH allowlist · pump+rhc read-only · {goplus_foot or 'intel'}"
+    )
+    narr_sub = (
+        "only one cluster survives"
+        if not _IS_RH
+        else "pump themes · RH KOL hot · not buy triggers"
+    )
+    manifold_sub = (
+        "4D · theme × liquidity × timing × risk"
+        if not _IS_RH
+        else "4D · m5 × m15 × liq × risk"
+    )
+    emb_title = "NARRATIVE EMBEDDING" if not _IS_RH else "INTEL SURFACE"
+    emb_accepted_lbl = "accepted" if not _IS_RH else "entered"
+    emb_rejected_lbl = "rejected" if not _IS_RH else "skipped"
+    cluster_lbl = "ROBINHOOD CLUSTER" if not _IS_RH else "ALLOWLIST PASS"
+    edge_sub = (
+        "expectancy per trade · rolling 40"
+        if not _IS_RH
+        else "RH closes · win/loss from engine"
+    )
+    sig_tag = "DARKPOOL · LIVE FEED" if not _IS_RH else "RH UNI-V3 · LIVE FEED"
+    brand_sub = "grok trencher" if not _IS_RH else "rh short desk"
     grid_cells = "".join(f'<div class="sg {c}"></div>' for c in ss.grid)
     if DESK_FF:
         flagged = max(0, 3 - state["risk"] // 30)
@@ -4052,7 +4527,12 @@ def trencher() -> None:
         theme=theme,
     )
     man_svg = svg_manifold(time.time() / 3.5)
-    emb_svg = svg_embed(ss.tick // 2, state["entered"], max(0, scan_seen - state["entered"]))
+    emb_svg = svg_embed(
+        ss.tick // 2,
+        state["entered"],
+        max(0, scan_seen - state["entered"]),
+        cluster_label=cluster_lbl,
+    )
     wal_svg = svg_wallet(ss.tick % 50)
     ruin_svg = svg_survival(state["ruin"], full_kelly)
     bars = volume_bars(ss.hist)
@@ -4090,7 +4570,7 @@ def trencher() -> None:
     aw_bar = 0.0 if float(state["avg_win"]) <= 0 else max(4.0, min(100.0, float(state["avg_win"]) / 10.0 * 100.0))
     al_bar = 0.0 if float(state["avg_loss"]) <= 0 else max(4.0, min(100.0, float(state["avg_loss"]) / 1.0 * 100.0))
 
-    # Scoreboard metrics (quote-native: USDC on Arc) — live wallet when available
+    # Scoreboard metrics (quote-native) — live wallet when available
     bal_sol = float(state["balance"])
     stake_sol = float(STAKE) if STAKE > 0 else float(state.get("balance") or 0)
     wallet_note = ""
@@ -4143,17 +4623,209 @@ def trencher() -> None:
             ss["arc_entry_cap"] = capped_entry_usdc(raw if raw > 0 else float(wbal.get("display_usdc") or 0))
         except Exception:
             pass
+    elif _IS_RH and not DESK_FF:
+        # Prefer rh_loop → engine_state wallet cache (no UI→RPC). Fallback RPC rare.
+        try:
+            from desk_realtime.rh_uniswap import hard_cap
+
+            _eng_w = _eng_early or {}
+            _w_ts = float(_eng_w.get("wallet_ts") or 0.0)
+            _w_age = time.time() - _w_ts if _w_ts > 0 else 1e9
+            _cache_ttl = float(os.environ.get("RH_UI_ENGINE_TTL", "90") or 90)
+            if _w_ts > 0 and _w_age <= _cache_ttl and (
+                float(_eng_w.get("wallet_usdg") or 0) > 0
+                or float(_eng_w.get("wallet_eth") or 0) > 0
+            ):
+                ss["rh_usdg"] = float(_eng_w.get("wallet_usdg") or 0.0)
+                ss["rh_eth"] = float(_eng_w.get("wallet_eth") or 0.0)
+                ss["rh_wallet_ts"] = _w_ts
+                if int(_eng_w.get("block") or 0) > 0:
+                    ss["rh_block"] = int(_eng_w["block"])
+                    ss["rh_block_ts"] = _w_ts
+                ss["rh_wallet_bootstrapped"] = True
+            else:
+                _rh_ttl = float(os.environ.get("RH_UI_RPC_TTL", "30") or 30)
+                _rh_age = time.time() - float(ss.get("rh_wallet_ts") or 0)
+                _have = bool(ss.get("rh_wallet_ts"))
+                # First frame: skip RPC so the desk chrome paints; next tick fills wallet.
+                if _have and _rh_age <= _rh_ttl:
+                    pass
+                elif _have or ss.get("rh_wallet_bootstrapped"):
+                    from desk_realtime.rh_net import USDG, fetch_eth_balance, wallet as rh_wallet
+                    from desk_realtime.rh_uniswap import erc20_balance
+
+                    who = rh_wallet()
+                    # Short UI timeout — never block the desk on a dead RPC hop.
+                    raw_usdg = (
+                        erc20_balance(USDG, who, timeout=1.2) / 1_000_000 if who else 0.0
+                    )
+                    eth = (
+                        float(fetch_eth_balance(who, timeout=1.0).get("eth") or 0.0)
+                        if who
+                        else 0.0
+                    )
+                    ss["rh_usdg"] = raw_usdg
+                    ss["rh_eth"] = eth
+                    ss["rh_wallet_ts"] = time.time()
+                else:
+                    ss["rh_wallet_bootstrapped"] = True
+            raw_usdg = float(ss.get("rh_usdg") or 0.0)
+            eth = float(ss.get("rh_eth") or 0.0)
+            _day_net = 0.0
+            try:
+                from desk_realtime.rh_strategy import realized_snapshot
+
+                _day_net = float(realized_snapshot().get("day_net_usdg") or 0.0)
+            except Exception:
+                _day_net = float((_eng_early or {}).get("day_net_usdg") or 0.0)
+            # Hard-cap stays in CAP KPI; THE BALANCE is NAV (cash + open marks).
+            _cap_only = float(hard_cap())
+            # Prefer live wallet / engine cache. Never use funded_usdg as the live tip —
+            # that re-anchors to the first-day mark and sawtooths the chart (12.58↔12.48).
+            cash_u = raw_usdg if raw_usdg > 0 else float(ss.get("rh_usdg") or 0.0)
+            if cash_u <= 0:
+                cash_u = float((_eng_early or {}).get("wallet_usdg") or 0.0)
+            from desk_realtime.rh_net import funding_mark as _rh_fm_bal, wallet_day_curve
+
+            _fm_bal = _rh_fm_bal(cash_u or None)
+            funded_u_only = float(_fm_bal.get("funded_usdg") or 0.0)
+            # Cold start only: no wallet sample yet.
+            if cash_u <= 0 and not ss.get("rh_wallet_bootstrapped"):
+                cash_u = funded_u_only or _cap_only
+            # Open-book mark → one equity line (PnL visible without a second curve).
+            open_mtm = 0.0
+            for _p in (_eng_early or {}).get("open_book") or []:
+                if not isinstance(_p, dict):
+                    continue
+                try:
+                    _e = float(_p.get("entry_usdg") or 0.0)
+                    _m = float(_p.get("live_mult") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if _e > 0 and _m > 0:
+                    open_mtm += _e * _m
+            show_u = cash_u + open_mtm  # NAV
+            if show_u > 0:
+                curve = wallet_day_curve(show_u, day_net=_day_net, nav=True)
+                pts = list(curve.get("points") or [])
+                daily = list(curve.get("daily") or [])
+                day_open = float(curve.get("open_usdg") or show_u)
+                funded_u = float(curve.get("funded_usdg") or 0.0)
+                fund_ts = float(curve.get("funded_at") or 0.0)
+                # Stake / tone baseline = first funded USDG (session), not midnight open.
+                stake_sol = (
+                    funded_u
+                    if funded_u > 0
+                    else (day_open if day_open > 0 else show_u)
+                )
+                bal_sol = show_u
+                wallet_note = f" · ETH {eth:.4f} gas"
+                _bal = str(ss.get("bal_mode") or "1d")
+
+                def _at_rh(ts: float) -> float:
+                    if not pts:
+                        return show_u
+                    val = float(pts[0].get("usdg") or 0.0)
+                    for p in pts:
+                        if float(p.get("ts") or 0) <= ts + 0.5:
+                            val = float(p.get("usdg") or 0.0)
+                    return val
+
+                if _bal == "1d" and daily:
+                    # 1D: one close per calendar day since funding.
+                    series = [float(b.get("usdg") or 0.0) for b in daily]
+                    if series:
+                        series[-1] = show_u
+                    if len(series) == 1:
+                        series = [series[0], show_u]
+                    up = show_u >= stake_sol
+                else:
+                    # RT: NAV samples only — skip legacy cash "live" cliffs in the series.
+                    nav_pts = [
+                        p
+                        for p in pts
+                        if str(p.get("tag") or "") not in ("buy", "sell", "fill", "live")
+                    ] or pts
+                    if len(nav_pts) >= 3:
+                        series = [float(p.get("usdg") or 0.0) for p in nav_pts]
+                        # Keep chart readable: downsample only if huge.
+                        if len(series) > 160:
+                            step = max(1, len(series) // 160)
+                            head = series[:1]
+                            mid = series[1:-1:step]
+                            series = head + mid + series[-1:]
+                        series[-1] = show_u
+                    else:
+                        t0 = fund_ts if fund_ts > 0 else (
+                            float(pts[0].get("ts") or 0.0) if pts else 0.0
+                        )
+                        if t0 <= 0 and now_local is not None:
+                            t0 = now_local.replace(
+                                hour=0, minute=0, second=0, microsecond=0
+                            ).timestamp()
+                        t1 = (
+                            now_local.timestamp()
+                            if now_local is not None
+                            else time.time()
+                        )
+                        span = max(1.0, t1 - t0)
+                        n = 64
+                        series = [_at_rh(t0 + span * i / (n - 1)) for i in range(n)]
+                        series[-1] = show_u
+                    up = show_u >= stake_sol
+                bal_cls = "g" if up else "r"
+                bal_tone = "up" if up else "dn"
+                chart_color = ("#137333" if theme == "day" else "#00ff66") if up else (
+                    "#b91c1c" if theme == "day" else "#ff3355"
+                )
+                bal_x = clock_axis
+                # Bars share the same series/time axis (TradingView volume sync).
+                _bars_html = volume_bars(series, match_curve=True)
+                bal_svg = svg_area_line(
+                    series,
+                    chart_color,
+                    label=f"{fmt_quote(show_u, 2)} {QUOTE}",
+                    x_labels=bal_x,
+                    progress=progress,
+                    theme=theme,
+                    money_axis=True,
+                    bars_html=_bars_html,
+                )
+                bars = ""  # embedded under shared time axis
+                ss["rh_bal_tag"] = "NAV" if open_mtm > 0 else ("WALLET" if cash_u > 0 else "CUMULATIVE")
+                ss["rh_series"] = series
+                ss["rh_cash_usdg"] = cash_u
+                ss["rh_open_mtm"] = open_mtm
+            else:
+                stake_sol = _cap_only
+                wallet_note = f" · ETH {eth:.4f} · bridge USDG"
+                ss["rh_bal_tag"] = "CUMULATIVE"
+        except Exception:
+            pass
     bal_subline = f"{state['multiple']:.1f}x the stake · {FEE_BLURB}"
     if DESK_CHAIN == "arc" and not DESK_FF:
         bal_subline = f"on-chain wallet · {FEE_BLURB}"
+    elif _IS_RH and not DESK_FF:
+        _nav_tag = str(ss.get("rh_bal_tag") or "")
+        if _nav_tag == "NAV":
+            bal_subline = f"NAV · cash+marks · {FEE_BLURB}"
+        else:
+            bal_subline = f"RH Uniswap · {FEE_BLURB}"
     realized_sol = float(state.get("pnl") or 0.0)
-    # Prefer Arc ledger net-of-gas when bots have closed books
+    # Prefer chain ledger when bots have closed books
     try:
-        from desk_realtime.arc_strategy import realized_snapshot
+        if _IS_RH:
+            from desk_realtime.rh_strategy import realized_snapshot
 
-        snap = realized_snapshot()
-        if int(snap.get("closes") or 0) > 0:
-            realized_sol = float(snap.get("realized_net_usdc") or realized_sol)
+            snap = realized_snapshot()
+            if int(snap.get("closes") or 0) > 0:
+                realized_sol = float(snap.get("realized_net_usdg") or realized_sol)
+        else:
+            from desk_realtime.arc_strategy import realized_snapshot
+
+            snap = realized_snapshot()
+            if int(snap.get("closes") or 0) > 0:
+                realized_sol = float(snap.get("realized_net_usdc") or realized_sol)
     except Exception:
         pass
     unreal_sol = float(state.get("unreal") or 0.0)
@@ -4180,7 +4852,9 @@ def trencher() -> None:
     gate_mode = "VETO / RETEST" if state["risk"] >= 40 else "PASS / ARM"
 
     # Scoreboard sparklines (right-side dynamic curves)
-    spark_bal_vals = [float(v) for v in (ss.hist or [STAKE])]
+    spark_bal_vals = [float(v) for v in (ss.get("rh_series") or ss.hist or [STAKE])]
+    if _IS_RH and not DESK_FF and ss.get("rh_series"):
+        spark_bal_vals = [float(v) for v in ss["rh_series"]]
     spark_rz_vals = []
     _rz_acc = 0.0
     for r in rows:
@@ -4223,12 +4897,47 @@ def trencher() -> None:
             realized_sol = float(live_m["realized_net_usdc"])
         except Exception:
             pass
+    if live_m.get("realized_net_usdg") is not None:
+        try:
+            realized_sol = float(live_m["realized_net_usdg"])
+        except Exception:
+            pass
+    if _eng_early.get("realized_net_usdg") is not None and _IS_RH:
+        try:
+            realized_sol = float(_eng_early["realized_net_usdg"])
+        except Exception:
+            pass
     boot_ts = float(ss.get("boot") or time.time())
     up_sec = int(live_m["uptime_sec"]) if live_m.get("uptime_sec") is not None else max(0, int(time.time() - boot_ts))
-    day_n = int(live_m["day"]) if live_m.get("day") is not None else max(1, 1 + up_sec // 86400)
+    funded_at = 0.0
+    funded_usdc = 0.0
+    if not DESK_FF and DESK_CHAIN == "arc":
+        try:
+            from desk_realtime.arc_net import funding_mark
+
+            mark = funding_mark()
+            funded_at = float(mark.get("funded_at") or 0)
+            funded_usdc = float(mark.get("funded_usdc") or 0)
+        except Exception:
+            funded_at = 0.0
+    elif not DESK_FF and _IS_RH:
+        try:
+            from desk_realtime.rh_net import funding_mark as rh_funding_mark
+
+            mark = rh_funding_mark(float(ss.get("rh_usdg") or 0.0) or None)
+            funded_at = float(mark.get("funded_at") or 0)
+            funded_usdc = float(mark.get("funded_usdg") or 0)
+        except Exception:
+            funded_at = 0.0
+    if funded_at > 0:
+        funded_elapsed = max(0, int(time.time() - funded_at))
+        day_n = 1 + funded_elapsed // 86400
+    else:
+        day_n = int(live_m["day"]) if live_m.get("day") is not None else max(1, 1 + up_sec // 86400)
+        funded_elapsed = 0
     up_h, up_m = up_sec // 3600, (up_sec % 3600) // 60
     uptime_txt = f"{up_h}h {up_m:02d}m"
-    # scouted_count → TRENCH; books → BOOKS; net_out → NOT BUY
+    # scouted_count → SCAN (RH) / TRENCH (legacy); books → BOOKS; net_out → NOT BUY
     trench_n = int(live_m.get("scouted_count", live_m.get("trench", state.get("entered") or 0)))
     books_n = int(live_m.get("books", state.get("closes") or 0))
     wr_raw = live_m.get("win_rate", state.get("win_rate") or 0)
@@ -4239,18 +4948,79 @@ def trencher() -> None:
             scan_seen = trench_n
         if _eng_early.get("net_out") is not None:
             not_buy_n = int(_eng_early["net_out"])
+        if _eng_early.get("not_buy") is not None:
+            not_buy_n = int(_eng_early["not_buy"])
         if _eng_early.get("win_rate") is not None:
             wr_raw = _eng_early["win_rate"]
+        if _IS_RH and _eng_early.get("slots_open") is not None:
+            books_n = int(_eng_early.get("slots_open") or 0)
+        if _IS_RH and _eng_early.get("wins") is not None and _eng_early.get("losses") is not None:
+            _cw = int(_eng_early.get("wins") or 0) + int(_eng_early.get("losses") or 0)
+            if _cw > 0 and _eng_early.get("win_rate") is None:
+                wr_raw = 100.0 * float(_eng_early.get("wins") or 0) / _cw
     wr_txt = f"{float(wr_raw):.1f}%"
+    if DESK_FF:
+        footer_pct = pct
+    elif funded_at > 0:
+        fh, fm = funded_elapsed // 3600, (funded_elapsed % 3600) // 60
+        when = datetime.fromtimestamp(funded_at).astimezone()
+        rz_sign_f = "+" if realized_sol >= 0 else "−"
+        if _IS_RH and not DESK_FF:
+            _day = float((_eng_early or {}).get("day_net_usdg") or realized_sol or 0)
+            _send = "SEND ON" if (_eng_early or {}).get("send_armed") else "SEND OFF"
+            rz_day = "+" if _day >= 0 else "−"
+            fd = funded_elapsed // 86400
+            fh, fm = (funded_elapsed % 86400) // 3600, (funded_elapsed % 3600) // 60
+            run_txt = f"{fd}d {fh}h {fm:02d}m" if fd > 0 else f"{fh}h {fm:02d}m"
+            # Total elapsed since first RH USDG — no hard-cap (shown in SIZE panel).
+            footer_time = (
+                f"FUNDED {when.strftime('%m-%d %H:%M')} · {fmt_quote(funded_usdc, 2)} {QUOTE}"
+                f" · run {run_txt} · {_send}"
+                f" · scan {trench_n} · skip {not_buy_n}"
+                f" · day {rz_day}{fmt_quote(abs(_day), 2)}"
+            )
+        else:
+            footer_time = (
+                f"FUNDED {when.strftime('%m-%d %H:%M')} · {fmt_quote(funded_usdc, 2)} {QUOTE}"
+                f" · {fh}h {fm:02d}m · {trench_n} scans · {not_buy_n} not buy"
+                f" · pnl {rz_sign_f}{fmt_quote(abs(realized_sol), 2)}"
+            )
+        footer_pct = (funded_elapsed % 86400) / 86400 * 100.0
+    elif _IS_RH and not DESK_FF:
+        _w = str(_eng_early.get("wallet") or "")
+        _day = float(_eng_early.get("day_net_usdg") or realized_sol or 0)
+        _send = "SEND ON" if _eng_early.get("send_armed") else "SEND OFF"
+        rz_sign_f = "+" if _day >= 0 else "−"
+        footer_time = (
+            f"RH {_w or 'wallet —'} · {_send}"
+            f" · scan {trench_n} · skip {not_buy_n}"
+            f" · day {rz_sign_f}{fmt_quote(abs(_day), 2)}"
+            f" · awaiting USDG fund"
+        )
+        footer_pct = pct
+    else:
+        footer_time = "FUNDED — · no balance seen yet"
+        footer_pct = pct
     agents_live = int(live_m["agents_live"]) if live_m.get("agents_live") is not None else sum(
         1 for v in busy_map.values() if v >= 0.45
     )
+    if not DESK_FF and _eng_early.get("agents_live") is not None:
+        agents_live = int(_eng_early["agents_live"])
     if not DESK_FF and str(_eng_early.get("desk_mode") or "") == "LIVE" and str(_eng_early.get("valve_gate") or "") == "OPEN":
-        agents_live = 5
+        if not _IS_RH:
+            agents_live = 5
     agents_txt = f"{agents_live}/5"
     wr_val_cls = "g" if float(wr_raw) >= 50 else ("y" if float(wr_raw) > 0 else "r")
     mult_n = float(live_m.get("multiple", state.get("multiple") or 0))
     mult_txt = f"{mult_n:.1f}x" if _eng_early.get("is_position_open") else "—"
+    if _IS_RH and not DESK_FF:
+        # MULTIPLE slot → hard cap / send (RH has no meme multiple)
+        _cap_v = float(_eng_early.get("hard_cap") or stake_sol or STAKE or 0)
+        mult_txt = f"{fmt_quote(_cap_v, 2)}"
+    kpi_scan_lbl = "SCAN" if _IS_RH else "TRENCH"
+    kpi_book_lbl = "SLOTS" if _IS_RH else "BOOKS"
+    kpi_mult_lbl = "CAP" if _IS_RH else "MULTIPLE"
+    kpi_skip_lbl = "SKIP" if _IS_RH else "NOT BUY"
     from desk_realtime.engine_state import read_engine_state, valve_closed
 
     eng = read_engine_state()
@@ -4272,8 +5042,104 @@ def trencher() -> None:
     valve_lbl = str(live_m.get("valve_gate") or ("CLOSED" if halted else "OPEN"))
     if valve_lbl == "CLOSED" or halted:
         gate_mode = "VALVE CLOSED"
+    if _IS_RH and not DESK_FF and not state.get("position"):
+        if valve_lbl == "CLOSED" or halted:
+            phase, blurb = "00 VALVE", "closed · no new buys"
+        elif not_buy_n > 0:
+            phase, blurb = "02 FILTER", "m5/m15 · liq · veto"
 
-    # Arc Testnet block height (cast → RPC fallback); smooth via TTL cache + last-good
+    # RH dock panels — same chrome as paper desk (wallet cluster + survival curve)
+    if _IS_RH and not DESK_FF:
+        _ob = _eng_early.get("open_book") or []
+        _slots_txt = f"{books_n}/{int(_eng_early.get('max_slots') or 1)}"
+        _cap_s = float(_eng_early.get("hard_cap") or STAKE or 0.3)
+        _day_s = float(_eng_early.get("day_net_usdg") or realized_sol or 0)
+        _day_lim = float(os.environ.get("RH_DAY_LOSS_USDG", "10") or 10)
+        _send_s = "ON" if _eng_early.get("send_armed") else "OFF"
+        _day_cls = "g" if _day_s >= 0 else "r"
+        _valve_pct = 100 if valve_lbl == "OPEN" else 8
+        # Survival curve keyed to day-loss burn (same visual language as paper ruin).
+        _burn = min(100.0, abs(min(0.0, _day_s)) / max(_day_lim, 0.01) * 100.0)
+        _rh_wal = svg_wallet((int(ss.tick) + int(trench_n)) % 97)
+        _rh_ruin = svg_survival(_burn, max(8.0, min(40.0, _cap_s * 80.0)))
+        if _ob:
+            _syms = [
+                f"${str(p.get('symbol') or '?')}"
+                for p in _ob[:3]
+                if isinstance(p, dict)
+            ]
+            _flag_lbl, _flag_val = "open", " · ".join(_syms) if _syms else "book"
+        else:
+            _flag_lbl, _flag_val = "book", "0 open"
+        wc_panel_inner = (
+            f"<div class='ph'>RH BOOK</div>"
+            f"<div class='wc-sub'>open slot · wallet · valve</div>"
+            f"<div class='wc-body'>"
+            f"<div class='chart-slot'>{_rh_wal}</div>"
+            f"<div class='wc-flag'><div class='lbl'>{_flag_lbl}</div>"
+            f"<div class='val'>{_flag_val}</div></div></div>"
+            f"<div class='wc-pressure'><span class='lbl'>valve {_esc(valve_lbl)}</span>"
+            f"<div class='ebar'><i style='width:{_valve_pct}%'></i></div></div>"
+        )
+        sz_panel_inner = (
+            f"<div class='ph'>SIZE · HARD CAP</div>"
+            f"<div class='sz-sub'><span>USDG notional</span>"
+            f"<span>day halt {_day_lim:g}</span></div>"
+            f"<div class='chart-slot'>{_rh_ruin}</div>"
+            f"<div class='sz-stats'>"
+            f"<div class='cell'><span class='lbl'>cap</span>"
+            f"<span class='val y'>{fmt_quote(_cap_s, 2)}</span></div>"
+            f"<div class='cell'><span class='lbl'>day net</span>"
+            f"<span class='val {_day_cls}'>{_day_s:+.2f}</span></div>"
+            f"<div class='cell'><span class='lbl'>send</span>"
+            f"<span class='val'>{_send_s}</span></div>"
+            f"</div>"
+        )
+        emb_foot_a = int(_eng_early.get("wins") or state.get("entered") or 0)
+        emb_foot_r = int(_eng_early.get("not_buy") or not_buy_n)
+        edge_n = int(_eng_early.get("wins") or 0) + int(_eng_early.get("losses") or 0)
+    else:
+        wc_panel_inner = (
+            f"<div class='ph'>WALLET CLUSTER</div>"
+            f"<div class='wc-sub'>linked buyers · exit pressure</div>"
+            f"<div class='wc-body'>"
+            f"<div class='chart-slot'>{wal_svg}</div>"
+            f"<div class='wc-flag'><div class='lbl'>linked</div>"
+            f"<div class='val'>{flagged} flagged</div></div></div>"
+            f"<div class='wc-pressure'><span class='lbl'>exit pressure</span>"
+            f"<div class='ebar'><i style='width:{exit_pressure}%'></i></div></div>"
+        )
+        sz_panel_inner = (
+            f"<div class='ph'>SIZING · RISK OF RUIN</div>"
+            f"<div class='sz-sub'><span>kelly vs survival</span><span>survival · 1000 sims</span></div>"
+            f"<div class='chart-slot'>{ruin_svg}</div>"
+            f"<div class='sz-stats'>"
+            f"<div class='cell'><span class='lbl'>full kelly</span>"
+            f"<span class='val y'>{full_kelly:.1f}%</span></div>"
+            f"<div class='cell'><span class='lbl'>used</span>"
+            f"<span class='val g'>{used_kelly:.1f}%</span></div>"
+            f"<div class='cell'><span class='lbl'>risk of ruin</span>"
+            f"<span class='val r'>{state['ruin']:.1f}%</span></div></div>"
+        )
+        emb_foot_a = state["entered"]
+        emb_foot_r = max(0, scan_seen - state["entered"])
+
+    # Edge model from RH engine closes when available
+    if _IS_RH and not DESK_FF:
+        _ew = int(_eng_early.get("wins") or 0)
+        _el = int(_eng_early.get("losses") or 0)
+        edge_n = _ew + _el
+        if edge_n == 0:
+            edge_tag = "no live closes"
+        else:
+            edge_tag = "edge accepted" if float(wr_raw) >= 50 else "edge rejected"
+        # reuse state expectancy bars but seed wr from engine
+        state["win_rate"] = float(wr_raw)
+        wr_bar = max(0.0, min(100.0, float(wr_raw)))
+        wr_cls = "pos" if float(wr_raw) > 0 else "neg"
+        wr_bar_cls = "g" if float(wr_raw) > 0 else "r"
+
+    # Chain block height; smooth via last-good
     block_txt = "—"
     chain_meta = "solana · 5 agents"
     if DESK_CHAIN == "arc" and not DESK_FF:
@@ -4297,41 +5163,102 @@ def trencher() -> None:
             chain_meta = "5 agents"
     elif DESK_CHAIN == "arc":
         chain_meta = "ff · 5 agents"
+    elif _IS_RH and not DESK_FF:
+        try:
+            from desk_realtime.rh_net import chain_id as rh_cid, preflight as rh_preflight
 
-    _arc_env, _arc_title = arc_network_label()
-    _arc_mark = arc_mark_data_uri()
-    _env_cls = "is-main" if _arc_env == "mainnet" else "is-test"
-    if _arc_mark:
+            _blk_ttl = float(os.environ.get("RH_UI_RPC_TTL", "30") or 30)
+            _blk_age = time.time() - float(ss.get("rh_block_ts") or 0)
+            prev = int(ss.get("rh_block") or 0)
+            cur = prev
+            _have_blk = bool(ss.get("rh_block_ts"))
+            # Prefer engine_state block from rh_loop; RPC only if cache cold.
+            _eng_blk = int((_eng_early or {}).get("block") or 0)
+            _eng_wts = float((_eng_early or {}).get("wallet_ts") or 0)
+            if _eng_blk > 0 and _eng_wts > 0 and (time.time() - _eng_wts) <= 90:
+                ss["rh_block"] = _eng_blk
+                ss["rh_block_ts"] = _eng_wts
+                cur = _eng_blk
+            elif _have_blk and _blk_age <= _blk_ttl:
+                pass
+            elif _have_blk or ss.get("rh_block_bootstrapped"):
+                pf = rh_preflight(timeout=1.0)
+                cur = int(pf.get("block") or 0)
+                if cur > 0:
+                    ss["rh_block"] = cur
+                elif prev > 0:
+                    cur = prev
+                ss["rh_block_ts"] = time.time()
+            else:
+                ss["rh_block_bootstrapped"] = True
+            cur = int(ss.get("rh_block") or cur or 0)
+            block_txt = f"{cur:,}" if cur else "—"
+            chain_meta = f"{rh_cid()} · RH short"
+            send_on = bool(_eng_early.get("send_armed"))
+            if send_on:
+                chain_meta += " · SEND"
+        except Exception:
+            prev_b = ss.get("rh_block")
+            block_txt = f"{int(prev_b):,}" if prev_b else "—"
+            chain_meta = f"{CHAIN_ID} · RH short"
+    elif _IS_RH:
+        chain_meta = "ff · RH"
+
+    if _IS_RH:
+        _net_env, _net_title = rh_network_label()
         arc_badge_html = (
-            f'<span class="net-badge" title="{_arc_title}">'
-            f'<img src="{_arc_mark}" alt="Arc" width="18" height="18"/>'
-            f'<span class="net-name">Arc</span>'
-            f'<span class="net-env {_env_cls}">{_arc_env}</span>'
+            f'<span class="net-badge" title="{_net_title}">'
+            f'<span class="net-name">Miki Crypto Bot</span>'
             f"</span>"
         )
     else:
-        arc_badge_html = (
-            f'<span class="net-badge" title="{_arc_title}">'
-            f'<span class="net-name">Arc</span>'
-            f'<span class="net-env {_env_cls}">{_arc_env}</span>'
-            f"</span>"
-        )
+        _arc_env, _arc_title = arc_network_label()
+        _arc_mark = arc_mark_data_uri()
+        _env_cls = "is-main" if _arc_env == "mainnet" else "is-test"
+        if _arc_mark:
+            arc_badge_html = (
+                f'<span class="net-badge" title="{_arc_title}">'
+                f'<img src="{_arc_mark}" alt="Arc" width="18" height="18"/>'
+                f'<span class="net-name">Arc</span>'
+                f'<span class="net-env {_env_cls}">{_arc_env}</span>'
+                f"</span>"
+            )
+        else:
+            arc_badge_html = (
+                f'<span class="net-badge" title="{_arc_title}">'
+                f'<span class="net-name">Arc</span>'
+                f'<span class="net-env {_env_cls}">{_arc_env}</span>'
+                f"</span>"
+            )
 
     _miki_mark = miki_mark_data_uri()
-    if _miki_mark:
-        miki_logo_html = f'<span class="logo"><img src="{_miki_mark}" alt="miki" width="28" height="28"/></span>'
+    _rh_mark = rh_mark_data_uri()
+    if _IS_RH:
+        brand_title = "Robinhood"
+        if _rh_mark:
+            miki_logo_html = (
+                f'<span class="logo is-rh"><img src="{_rh_mark}" alt="Robinhood" width="28" height="28"/></span>'
+            )
+        else:
+            miki_logo_html = '<span class="logo is-rh">◆</span>'
+        brand_title_html = f'<span class="title is-rh">{brand_title}</span>'
     else:
-        miki_logo_html = '<span class="logo">⚡</span>'
+        brand_title = "miki crypto bot"
+        if _miki_mark:
+            miki_logo_html = f'<span class="logo"><img src="{_miki_mark}" alt="miki" width="28" height="28"/></span>'
+        else:
+            miki_logo_html = '<span class="logo">⚡</span>'
+        brand_title_html = f'<span class="title">{brand_title}</span>'
 
     desk_html = f"""
 <div class="{desk_dc_cls}" data-theme="{theme}">
   {dc_banner}
   <div class="glass topbar">
-    <div class="brand">{miki_logo_html}<span class="title">miki crypto bot</span></div>
+    <div class="brand">{miki_logo_html}{brand_title_html}</div>
     {arc_badge_html}
     <div class="vdiv"></div>
     <div class="id">
-      <div class="sub">grok trencher</div>
+      <div class="sub">{brand_sub}</div>
       <div class="meta">{chain_meta} · {desk_mode}</div>
     </div>
     <div class="vdiv"></div>
@@ -4340,13 +5267,13 @@ def trencher() -> None:
         <div class="kv"><span class="lbl">BLOCK</span><span class="val g">{block_txt}</span></div>
         <div class="kv"><span class="lbl">DAY</span><span class="val">{day_n}</span></div>
         <div class="kv"><span class="lbl">UPTIME</span><span class="val">{uptime_txt}</span></div>
-        <div class="kv"><span class="lbl">TRENCH</span><span class="val">{trench_n}</span></div>
-        <div class="kv"><span class="lbl">BOOKS</span><span class="val">{books_n}</span></div>
+        <div class="kv"><span class="lbl">{kpi_scan_lbl}</span><span class="val">{trench_n}</span></div>
+        <div class="kv"><span class="lbl">{kpi_book_lbl}</span><span class="val">{books_n}</span></div>
         <div class="kv"><span class="lbl">WIN RATE</span><span class="val {wr_val_cls}">{wr_txt}</span></div>
         <div class="kv"><span class="lbl">AGENTS</span><span class="val g">{agents_txt}</span></div>
         <div class="kv"><span class="lbl">STAKE</span><span class="val">{fmt_quote(stake_sol, 2)} {QUOTE}</span></div>
-        <div class="kv"><span class="lbl">MULTIPLE</span><span class="val y">{mult_txt}</span></div>
-        <div class="kv"><span class="lbl">NOT BUY</span><span class="val r">{not_buy_n}</span></div>
+        <div class="kv"><span class="lbl">{kpi_mult_lbl}</span><span class="val y">{mult_txt}</span></div>
+        <div class="kv"><span class="lbl">{kpi_skip_lbl}</span><span class="val r">{not_buy_n}</span></div>
       </div>
       <div class="{live_cls}">{live_lbl}</div>
       <span class="theme-chip" title="auto by local clock · 07:00–19:00 DAY">
@@ -4400,7 +5327,11 @@ def trencher() -> None:
   <div class="desk-top">
     <div class="glass">
       <div class="ph ph-green"><span>THE BALANCE</span>
-        <span class="tag">CUMULATIVE · {span_tag} · {fmt_quote(stake_sol, 2)} {QUOTE} → NOW</span></div>
+        <span class="tag">{ss.get("rh_bal_tag") or "CUMULATIVE"} · {span_tag} · {fmt_quote(stake_sol, 2)} {QUOTE} → NOW</span>
+        <span class="bal-mode-row">
+          <a class="{"on" if ss.get("bal_mode") == "1d" else ""}" href="?bal=1d" title="日线 · 入金日起按天">1D</a>
+          <a class="{"on" if ss.get("bal_mode") == "rt" else ""}" href="?bal=rt" title="实时 · 入金→现在全程密曲线">RT</a>
+        </span></div>
       <div class="bal-head">
         <div>
           <div class="bal-big {bal_tone}">{fmt_quote(bal_sol, 2)} <span class="unit">{QUOTE}</span></div>
@@ -4412,7 +5343,7 @@ def trencher() -> None:
         </div>
       </div>
       <div class="chart-slot">{bal_svg}</div>
-      <div class="outcome-row">{bars}</div>
+      {f'<div class="outcome-row">{bars}</div>' if bars else ""}
     </div>
     <div class="desk-top-right">
       <div class="pair pair-top">
@@ -4445,7 +5376,7 @@ def trencher() -> None:
     <div class="glass sig-module">
       <div class="sig-head">
         <span class="sig-title">◆ SIGNAL INTERCEPT</span>
-        <span class="sig-tag">DARKPOOL · LIVE FEED</span>
+        <span class="sig-tag">{sig_tag}</span>
       </div>
       <div class="sig-wave">{sig_bars}</div>
     </div>
@@ -4456,7 +5387,7 @@ def trencher() -> None:
     <div class="desk-left">
       <div class="glass">
         <div class="agents-panel">
-          <div class="ph ph-green">SCANNER · NARRATIVE · RISK · TIMING · EXIT</div>
+          <div class="ph ph-green">{agents_ph}</div>
           <div class="stage"><div class="agents floor">{agents_html}</div></div>
         </div>
       </div>
@@ -4465,7 +5396,7 @@ def trencher() -> None:
         <div class="glass">
           <div class="mf-panel">
             <div class="ph">STRATEGY MANIFOLD</div>
-            <div class="mf-sub">4D · theme × liquidity × timing × risk</div>
+            <div class="mf-sub">{manifold_sub}</div>
             <div class="chart-slot">{man_svg}</div>
             <div class="mf-foot">
               <span class="g">dims 4/4</span>
@@ -4475,12 +5406,12 @@ def trencher() -> None:
         </div>
         <div class="glass">
           <div class="emb-panel">
-            <div class="ph">NARRATIVE EMBEDDING</div>
-            <div class="emb-sub">only one cluster survives</div>
+            <div class="ph">{emb_title}</div>
+            <div class="emb-sub">{narr_sub}</div>
             <div class="chart-slot">{emb_svg}</div>
             <div class="emb-foot">
-              <span class="g">accepted {state["entered"]}</span>
-              <span class="r">rejected {max(0, scan_seen - state["entered"])}</span>
+              <span class="g">{emb_accepted_lbl} {emb_foot_a}</span>
+              <span class="r">{emb_rejected_lbl} {emb_foot_r}</span>
             </div>
           </div>
         </div>
@@ -4497,7 +5428,7 @@ def trencher() -> None:
         </div>
         <div class="glass">
           <div class="panel-name">SCAN GRID</div>
-          <div class="panel-sub">{scan_seen} launches seen · {goplus_foot}</div>
+          <div class="panel-sub">{scan_sub}</div>
           <div class="glass-body"><div class="scan-wrap">
             <div class="scan-grid">{grid_cells}</div>
             <div class="glass-foot">seen {scan_seen} · entered {state["entered"]}</div>
@@ -4508,7 +5439,7 @@ def trencher() -> None:
       <div class="glass edge-card">
         <div class="edge-head">
           <div class="edge-title">EDGE MODEL</div>
-          <div class="edge-sub">expectancy per trade · rolling 40</div>
+          <div class="edge-sub">{edge_sub}</div>
         </div>
         <div class="edge-body">
           <div class="edge-left">
@@ -4539,43 +5470,12 @@ def trencher() -> None:
       <div class="pair pair-bot">
         <div class="glass">
           <div class="wc-panel">
-            <div class="ph">WALLET CLUSTER</div>
-            <div class="wc-sub">linked buyers · exit pressure</div>
-            <div class="wc-body">
-              <div class="chart-slot">{wal_svg}</div>
-              <div class="wc-flag">
-                <div class="lbl">linked</div>
-                <div class="val">{flagged} flagged</div>
-              </div>
-            </div>
-            <div class="wc-pressure">
-              <span class="lbl">exit pressure</span>
-              <div class="ebar"><i style="width:{exit_pressure}%"></i></div>
-            </div>
+            {wc_panel_inner}
           </div>
         </div>
         <div class="glass">
           <div class="sz-panel">
-            <div class="ph">SIZING · RISK OF RUIN</div>
-            <div class="sz-sub">
-              <span>kelly vs survival</span>
-              <span>survival · 1000 sims</span>
-            </div>
-            <div class="chart-slot">{ruin_svg}</div>
-            <div class="sz-stats">
-              <div class="cell">
-                <span class="lbl">full kelly</span>
-                <span class="val y">{full_kelly:.1f}%</span>
-              </div>
-              <div class="cell">
-                <span class="lbl">used</span>
-                <span class="val g">{used_kelly:.1f}%</span>
-              </div>
-              <div class="cell">
-                <span class="lbl">risk of ruin</span>
-                <span class="val r">{state["ruin"]:.1f}%</span>
-              </div>
-            </div>
+            {sz_panel_inner}
           </div>
         </div>
       </div>
@@ -4586,7 +5486,7 @@ def trencher() -> None:
   <div class="glass footer">
     <span class="who">● desk @cryptoart_miki</span>
     <span class="time">{footer_time}</span>
-    <span class="bar"><i style="width:{pct:.1f}%"></i></span>
+    <span class="bar"><i style="width:{footer_pct:.1f}%"></i></span>
   </div>
   </div>
 </div>
@@ -4664,4 +5564,13 @@ def trencher() -> None:
             st.rerun()
 
 
+def install_balance_zoom() -> None:
+    """Balance wheel-zoom disabled — MutationObserver fought Streamlit and froze the tab.
+
+    Re-enable later with a wheel-only handler (no document.body observer).
+    """
+    return
+
+
 trencher()
+# Zoom installer intentionally no-op (see install_balance_zoom).

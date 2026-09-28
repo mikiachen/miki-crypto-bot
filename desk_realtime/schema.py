@@ -42,6 +42,33 @@ def _log_text(ev: dict[str, Any], fallback: str) -> str:
     return str(ev.get("log_text") or ev.get("msg") or ev.get("note") or fallback)
 
 
+def _buy_detail(ev: dict[str, Any], *, panel: str, agent: str, note: str) -> dict[str, Any]:
+    """Keep the loop's live mark. Do not invent a multiple here."""
+    detail: dict[str, Any] = {
+        "event": "ENTRY" if panel == "ARMING" else "BUY",
+        "agent_type": agent or "TIMING",
+        "panel": panel,
+        "note": note,
+        "source": "ws",
+        "unit": QUOTE,
+    }
+    raw_mult = ev.get("mult") if ev.get("mult") is not None else ev.get("multiple")
+    if raw_mult is not None:
+        try:
+            detail["mult"] = float(raw_mult)
+        except (TypeError, ValueError):
+            pass
+    try:
+        mark_usdc = float(ev.get("mark_usdc") or 0)
+    except (TypeError, ValueError):
+        mark_usdc = 0.0
+    if mark_usdc > 0:
+        detail["mark_usdc"] = mark_usdc
+    if ev.get("mark_src"):
+        detail["mark_src"] = str(ev.get("mark_src"))
+    return detail
+
+
 def normalize_ws_event(ev: dict[str, Any]) -> dict[str, Any] | None:
     """
     Map a live WS packet into one jsonl row the existing ingest understands.
@@ -146,20 +173,15 @@ def normalize_ws_event(ev: dict[str, Any]) -> dict[str, Any] | None:
             "score": float(ev.get("score") or 0.88),
             "amount": amt,
             "tx_id": str(ev.get("tx_id") or "ws_live"),
+            "token_address": str(ev.get("token_address") or ""),
+            "launchpad": str(ev.get("launchpad") or ""),
             "all_agent_scores": ev.get("all_agent_scores")
             or {
                 "narrative": {"virality": 0.94},
                 "auditor": {"organic_score": 0.82},
                 "crypto_pulse": {"go_signal": 0.78},
             },
-            "detail": {
-                "event": "ENTRY" if panel == "ARMING" else "BUY",
-                "agent_type": agent or "TIMING",
-                "panel": panel,
-                "note": note,
-                "source": "ws",
-                "unit": QUOTE,
-            },
+            "detail": _buy_detail(ev, panel=panel, agent=agent, note=note),
         }
 
     if status in ("EXIT", "CLOSE", "SETTLE"):

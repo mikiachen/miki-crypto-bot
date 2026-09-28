@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import threading
@@ -47,6 +48,9 @@ CLUSTER_VETO_SCORE = float(os.environ.get("ARC_CLUSTER_VETO", "0.55"))
 
 # —— 3. Anti-snipe ——
 PRIORITY_BUMP = float(os.environ.get("ARC_PRIORITY_BUMP", "1.10"))  # +10%
+# Composite floor. Robinhood/stock desk used 0.60; crypto template used 0.62
+# on a 4-factor blend. Do not apply either number to the LLM score alone.
+ARC_BOOK_MIN = float(os.environ.get("ARC_BOOK_MIN", "0.60"))
 
 # —— 4. PnL / valve ——
 GAS_ESTIMATE_USDC = float(os.environ.get("ARC_GAS_ESTIMATE_USDC", "0.02"))
@@ -184,6 +188,68 @@ def _cast_balance_usdc(address: str, timeout: float = 8.0) -> float | None:
     except Exception as exc:  # noqa: BLE001
         log.info("cast balance liq probe failed: %s", sanitize_exc(exc))
         return None
+
+
+def _log_unit(value: float, decade: float) -> float:
+    if value <= 1 or decade <= 0:
+        return 0.0
+    return max(0.0, min(1.0, math.log10(value) / decade))
+
+
+def arc_book_score(
+    narr_score: float,
+    row: dict[str, Any] | None,
+    check: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Arc tape + Robinhood-style multi-factor floor.
+
+    Crypto template weights were audit/narrative/momentum/pulse, and 0.62 was
+    the blend. This desk was applying 0.62 to narrative only. Robinhood's
+    stock book (0.60) refuses to let one signal buy. Arc's reliable signal is
+    the Dexscreener tape, so volume takes the weight narrative used to have.
+    """
+    row = row or {}
+    check = check or {}
+    narrative = max(0.0, min(1.0, float(narr_score or 0.0)))
+    audit = 0.8 if check.get("contract_ok") else 0.15
+    momentum = 0.6 * _log_unit(float(row.get("volume_h24") or check.get("volume_h24") or 0), 7.0)
+    momentum += 0.4 * _log_unit(float(row.get("liquidity_usdc") or 0), 6.0)
+    buyers = int(check.get("buyers_h1") or row.get("buyers_h1") or 0)
+    sellers = int(check.get("sellers_h1") or row.get("sellers_h1") or 0)
+    pulse = (buyers / (buyers + sellers)) if (buyers + sellers) else 0.35
+    kline = {"up": 0.80, "flat": 0.50, "down": 0.15, "unread": 0.45}.get(
+        str(check.get("kline") or "unread"), 0.45
+    )
+    weights = {
+        "audit": 0.25,
+        "narrative": 0.20,
+        "momentum": 0.30,
+        "pulse": 0.15,
+        "kline": 0.10,
+    }
+    parts = {
+        "audit": audit,
+        "narrative": narrative,
+        "momentum": momentum,
+        "pulse": pulse,
+        "kline": kline,
+    }
+    score = round(sum(parts[k] * weights[k] for k in weights), 3)
+    if row and not check.get("contract_ok"):
+        reason = "contract unread"
+        buy = False
+    else:
+        reason = "above_book" if score >= ARC_BOOK_MIN else "below_book"
+        buy = score >= ARC_BOOK_MIN
+    return {
+        "score": score,
+        "buy": buy,
+        "reason": reason,
+        "threshold": ARC_BOOK_MIN,
+        "parts": {k: round(v, 2) for k, v in parts.items()},
+        "weights": weights,
+    }
 
 
 def probe_liquidity_usdc(token_or_pool: str) -> dict[str, Any]:
@@ -380,6 +446,22 @@ def _pnl_save(state: dict[str, Any]) -> None:
     tmp.replace(_PNL_LEDGER)
 
 
+def day_loss_halt() -> tuple[bool, str]:
+    """Stop new buys after today's realized loss hits the book limit."""
+    try:
+        cap = abs(float(os.environ.get("ARC_DAY_LOSS_USDC", "10")))
+    except ValueError:
+        cap = 10.0
+    st = _pnl_load()
+    day = time.strftime("%Y-%m-%d", time.localtime())
+    if st.get("day") != day:
+        return False, ""
+    net = float(st.get("day_net_usdc") or 0)
+    if net <= -cap:
+        return True, f"day loss {net:.2f} ≤ -{cap:.2f}"
+    return False, ""
+
+
 def record_close_pnl(
     *,
     entry_usdc: float,
@@ -399,10 +481,15 @@ def record_close_pnl(
         st = _pnl_load()
         st["realized_gross_usdc"] = float(st.get("realized_gross_usdc") or 0) + gross
         st["gas_paid_usdc"] = float(st.get("gas_paid_usdc") or 0) + gas
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        if st.get("day") != day:
+            st["day"] = day
+            st["day_net_usdc"] = 0.0
+        st["day_net_usdc"] = float(st.get("day_net_usdc") or 0) + net
         st["realized_net_usdc"] = float(st.get("realized_net_usdc") or 0) + net
         st["closes"] = int(st.get("closes") or 0) + 1
         st["ts"] = time.time()
-        if equity_mark is not None:
+        if equity_mark is not None and float(equity_mark) > 0:
             peak = float(st.get("peak_equity_usdc") or equity_mark)
             peak = max(peak, float(equity_mark))
             st["peak_equity_usdc"] = peak
@@ -420,32 +507,90 @@ def realized_snapshot() -> dict[str, Any]:
         return _pnl_load()
 
 
-def should_tighten_valve(unreal_usdc: float, equity_usdc: float) -> tuple[bool, str]:
-    """If floating book drawdown vs peak is violent → close entry valve."""
+def should_tighten_valve(
+    unreal_usdc: float,
+    equity_usdc: float,
+    *,
+    cost_usdc: float = 0.0,
+) -> tuple[bool, str]:
+    """Close entries only when this bag is down versus its own cost.
+
+    A leftover peak from an old 0.50 display is not a 40% drawdown on a 0.30 bag.
+    """
+    basis = float(cost_usdc or 0)
+    if basis <= 0:
+        basis = float(equity_usdc or 0)
     with _LOCK:
         st = _pnl_load()
-        peak = float(st.get("peak_equity_usdc") or equity_usdc or 0)
-        if equity_usdc > peak:
-            st["peak_equity_usdc"] = equity_usdc
-            st["valve_tight"] = False
-            _pnl_save(st)
+        if basis <= 0:
             return False, ""
-        peak = max(peak, equity_usdc)
-        if peak <= 0:
-            return False, ""
-        dd = (peak - equity_usdc) / peak
-        # Also react to large negative unreal relative to stake slice
-        if unreal_usdc < -abs(peak) * DRAWDOWN_VALVE_PCT:
+        shock = float(unreal_usdc) < -abs(basis) * DRAWDOWN_VALVE_PCT
+        if shock:
             st["valve_tight"] = True
-            st["valve_reason"] = f"unreal shock {unreal_usdc:.2f}"
+            st["valve_reason"] = f"unreal shock {float(unreal_usdc):.2f}"
+            st["peak_equity_usdc"] = max(float(st.get("peak_equity_usdc") or 0), basis)
             _pnl_save(st)
             return True, st["valve_reason"]
-        if dd >= DRAWDOWN_VALVE_PCT:
-            st["valve_tight"] = True
-            st["valve_reason"] = f"drawdown {dd:.1%}"
-            _pnl_save(st)
-            return True, st["valve_reason"]
-        return bool(st.get("valve_tight")), str(st.get("valve_reason") or "")
+        # Live bag is not down 12% of its cost. Do not keep a stale latch.
+        st["valve_tight"] = False
+        st.pop("valve_reason", None)
+        st["peak_equity_usdc"] = max(float(equity_usdc or 0), basis)
+        st["drawdown_pct"] = 0.0
+        _pnl_save(st)
+        return False, ""
+
+
+def remember_close(address: str, symbol: str = "") -> None:
+    """Same contract is not a new setup again for ARC_REBUY_COOLDOWN_SEC."""
+    key = (address or "").strip().lower()
+    if not key.startswith("0x"):
+        return
+    with _LOCK:
+        st = _pnl_load()
+        rows = st.get("recent_closes") if isinstance(st.get("recent_closes"), list) else []
+        rows = [r for r in rows if isinstance(r, dict) and str(r.get("address") or "").lower() != key]
+        rows.append({"address": key, "symbol": symbol, "ts": time.time()})
+        st["recent_closes"] = rows[-24:]
+        _pnl_save(st)
+
+
+def recently_closed(address: str) -> bool:
+    key = (address or "").strip().lower()
+    if not key.startswith("0x"):
+        return False
+    try:
+        cool = float(os.environ.get("ARC_REBUY_COOLDOWN_SEC", "21600"))
+    except ValueError:
+        cool = 21600.0
+    with _LOCK:
+        st = _pnl_load()
+        rows = st.get("recent_closes") if isinstance(st.get("recent_closes"), list) else []
+    now = time.time()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("address") or "").lower() != key:
+            continue
+        if now - float(row.get("ts") or 0) < cool:
+            return True
+    return False
+
+
+def note_ghost_miss(address: str, cost_usdc: float) -> bool:
+    """A broadcast that left no tokens is a miss, recorded once."""
+    key = (address or "").strip().lower()
+    if not key.startswith("0x") or cost_usdc <= 0:
+        return False
+    with _LOCK:
+        st = _pnl_load()
+        seen = st.get("ghosts") if isinstance(st.get("ghosts"), list) else []
+        if key in seen:
+            return False
+        seen.append(key)
+        st["ghosts"] = seen[-24:]
+        _pnl_save(st)
+    record_close_pnl(entry_usdc=cost_usdc, exit_mult=0.0, gas_usdc=0.0, equity_mark=0.0)
+    return True
 
 
 def clear_valve_tight() -> None:
@@ -453,4 +598,6 @@ def clear_valve_tight() -> None:
         st = _pnl_load()
         st["valve_tight"] = False
         st.pop("valve_reason", None)
+        st["peak_equity_usdc"] = 0.0
+        st["drawdown_pct"] = 0.0
         _pnl_save(st)

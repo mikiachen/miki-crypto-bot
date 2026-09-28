@@ -4,6 +4,7 @@
 mode: "paper"            # "paper" | "live". "live" additionally requires --i-understand-the-risk
 
 grok:
+  # Prefer env GROK_API_KEY / XAI_API_KEY (loaded by src.desk).
   api_key: "xai-REPLACE_ME"
   base_url: "https://api.x.ai/v1/chat/completions"
   models:
@@ -43,6 +44,7 @@ arc:
   # default_curve: "0x..."             # optional BondingCurve address
 
 alpaca:
+  # Prefer env ALPACA_API_KEY / ALPACA_API_SECRET (loaded by src.desk).
   api_key: "REPLACE_ME"
   api_secret: "REPLACE_ME"
   paper: true

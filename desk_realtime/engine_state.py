@@ -66,10 +66,18 @@ def read_engine_state() -> dict[str, Any]:
         return {}
 
 
-def set_valve(closed: bool) -> None:
-    """Valve Gate: CLOSED pauses new entries; OPEN resumes."""
+def set_valve(closed: bool, reason: str = "") -> None:
+    """Valve Gate: CLOSED pauses new entries; OPEN resumes.
+
+    reason=panic stays shut after a flatten. reason=strategy may reopen
+    once the book is flat and the daily loss halt is not hit.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    VALVE_PATH.write_text("CLOSED" if closed else "OPEN", encoding="utf-8")
+    if closed:
+        why = (reason or "strategy").strip().lower()
+        VALVE_PATH.write_text(f"CLOSED {why}", encoding="utf-8")
+    else:
+        VALVE_PATH.write_text("OPEN", encoding="utf-8")
     if closed:
         HALT_PATH.write_text("1", encoding="utf-8")
     elif HALT_PATH.exists():
@@ -83,8 +91,18 @@ def valve_closed() -> bool:
     if HALT_PATH.exists():
         return True
     if VALVE_PATH.is_file():
-        return VALVE_PATH.read_text(encoding="utf-8").strip().upper() == "CLOSED"
+        return VALVE_PATH.read_text(encoding="utf-8").strip().upper().startswith("CLOSED")
     return False
+
+
+def valve_reason() -> str:
+    if not VALVE_PATH.is_file():
+        return ""
+    text = VALVE_PATH.read_text(encoding="utf-8").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) == 2 and parts[0].upper() == "CLOSED":
+        return parts[1].lower()
+    return ""
 
 
 def request_panic(
@@ -99,7 +117,7 @@ def request_panic(
         age = time.time() - PANIC_PATH.stat().st_mtime
         if age < 8:
             return
-    set_valve(True)
+    set_valve(True, reason="panic")
     payload = {
         "ts": time.time(),
         "symbol": str(symbol or "").lstrip("$").upper(),

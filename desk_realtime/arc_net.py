@@ -354,6 +354,7 @@ def fetch_wallet_usdc(
 
 
 _DAY_PATH = Path(__file__).resolve().parents[1] / "grok-trading-desk" / "logs" / "wallet_day.json"
+_FUND_PATH = Path(__file__).resolve().parents[1] / "grok-trading-desk" / "logs" / "funding_epoch.json"
 
 
 def wallet_day_curve(address: str | None = None) -> dict[str, Any]:
@@ -388,12 +389,45 @@ def wallet_day_curve(address: str | None = None) -> dict[str, Any]:
     }
 
 
+def funding_mark() -> dict[str, Any]:
+    """First non-zero wallet the desk actually saw. Survives restarts. Never invented."""
+    try:
+        if _FUND_PATH.is_file():
+            saved = json.loads(_FUND_PATH.read_text())
+            if isinstance(saved, dict) and float(saved.get("funded_at") or 0) > 0:
+                return saved
+    except Exception:
+        saved = {}
+    ts = 0.0
+    usdc = 0.0
+    try:
+        if _DAY_PATH.is_file():
+            curve = json.loads(_DAY_PATH.read_text())
+            for pt in curve.get("points") or []:
+                amt = float(pt.get("usdc") or 0)
+                when = float(pt.get("ts") or 0)
+                if amt > 0 and when > 0 and (ts <= 0 or when < ts):
+                    ts, usdc = when, amt
+    except Exception:
+        ts = 0.0
+    if ts <= 0:
+        return {}
+    row = {"funded_at": ts, "funded_usdc": round(usdc, 6), "source": "wallet_day"}
+    try:
+        _FUND_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _FUND_PATH.write_text(json.dumps(row), encoding="utf-8")
+    except Exception:
+        pass
+    return row
+
+
 def cast_send(
     *,
     to: str,
     value_wei: int = 0,
     sig: str | None = None,
     args: list[str] | None = None,
+    data: str | None = None,
     private_key: str | None = None,
     timeout: float = 60.0,
     anti_snipe: bool = True,
@@ -404,6 +438,7 @@ def cast_send(
     Broadcast via local `cast send`. No balance preflight.
     anti_snipe=True → priority / gas price × 1.10 (抢跑建仓).
     Tries primary RPC then backup on failure.
+    `data` is raw calldata for Universal Router / approval txs. Never log the key.
     """
     ensure_foundry_on_path()
     cast = tool_path("cast")
@@ -412,6 +447,11 @@ def cast_send(
         return {"ok": False, "error": "ARC_PRIVATE_KEY not set", "tx_id": ""}
     if cast is None:
         return {"ok": False, "error": "cast binary missing", "tx_id": ""}
+    raw_data = (data or "").strip()
+    if raw_data and (not raw_data.startswith("0x") or len(raw_data) < 10):
+        return {"ok": False, "error": "invalid calldata", "tx_id": ""}
+    if raw_data and sig:
+        return {"ok": False, "error": "cast send refuses sig+data together", "tx_id": ""}
 
     if anti_snipe and (priority_gwei is None or gas_price_gwei is None):
         try:
@@ -433,6 +473,8 @@ def cast_send(
         if sig:
             cmd.append(sig)
             cmd.extend(str(a) for a in (args or []))
+        if raw_data:
+            cmd.extend(["--data", raw_data])
         cmd.extend(
             [
                 "--value",
@@ -450,10 +492,11 @@ def cast_send(
             ]
         )
         log.info(
-            "cast send → %s value_wei=%s sig=%s prio=%s anti_snipe=%s rpc=%s",
+            "cast send → %s value_wei=%s sig=%s data=%s prio=%s anti_snipe=%s rpc=%s",
             to[:12],
             value_wei,
             sig or "(plain)",
+            f"{len(raw_data)}b" if raw_data else "none",
             priority_gwei,
             anti_snipe,
             rpc,

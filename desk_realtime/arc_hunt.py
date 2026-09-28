@@ -48,10 +48,11 @@ def capped_entry_usdc(balance_usdc: float, requested: float | None = None) -> fl
     bal = max(0.0, float(balance_usdc or 0.0))
     ceiling = _buy_ceiling()
     gas_keep = 0.05
-    if bal < 0.5 + gas_keep:
+    trial = min(0.3, ceiling)
+    if bal < trial + gas_keep:
         return 0.0
     if requested is None:
-        requested = min(0.5, ceiling)
+        requested = trial
     size = min(max(0.0, float(requested)), ceiling, bal - gas_keep)
     return round(size, 4)
 

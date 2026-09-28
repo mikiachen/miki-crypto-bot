@@ -1,9 +1,10 @@
-"""LLM token-fee budget — paid OpenRouter stays on while the wallet has USDC.
+"""LLM token-fee budget.
 
 Rules (Arc desk):
-  1. Cut the paid API only when on-chain USDC is 0. A 100 USDC reserve does not apply.
-  2. Each LLM call still records LLM_COST_PER_CALL_USDC on a local credit ledger
-     (accounting only — not a chain transfer, and not a gate).
+  1. Cut the paid API when on-chain USDC is 0.
+  2. Cut it when today's ledger would pass LLM_DAILY_CAP_USDC.
+     Lifetime spend is not the gate — a 14 USDC book must not fund an open-ended narrative loop.
+  3. Each call records LLM_COST_PER_CALL_USDC locally. That number is not a chain transfer.
 """
 
 from __future__ import annotations
@@ -87,19 +88,45 @@ def status() -> dict[str, Any]:
         }
 
 
+def _today() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _roll_day(st: dict[str, Any]) -> dict[str, Any]:
+    day = _today()
+    if st.get("day") != day:
+        st["day"] = day
+        st["spent_today"] = 0.0
+        st["calls_today"] = 0
+    return st
+
+
+def daily_cap_usdc() -> float:
+    raw = (os.environ.get("LLM_DAILY_CAP_USDC") or "0.30").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.30
+
+
 def _decide(bal: float, credit: float, st: dict[str, Any]) -> tuple[bool, str]:
-    # Paid OpenRouter stays on until the wallet is empty. Earnings credit is
-    # a ledger only — it must not cut the API while USDC remains.
-    del credit, st
+    # Earnings credit is a ledger only. The hard stops are an empty wallet
+    # and today's cap, so narrative calls cannot outrun principal.
+    del credit
     if bal <= 0:
         return False, "钱包归零 · API切断"
+    cap = daily_cap_usdc()
+    spent_today = float(st.get("spent_today") or 0.0)
+    if spent_today + LLM_COST_PER_CALL_USDC > cap:
+        return False, f"今日叙事额度用完 · {spent_today:.3f}/{cap:.3f}"
     return True, "ok"
 
 
 def allow_llm_call() -> tuple[bool, str]:
-    """Gate before any OpenRouter/Anthropic request."""
+    """Gate before any paid narrative request."""
     with _LOCK:
-        st = _load()
+        st = _roll_day(_load())
+        _save(st)
         bal = wallet_usdc()
         credit = float(st.get("credit") or 0.0)
         ok, reason = _decide(bal, credit, st)
@@ -114,11 +141,13 @@ def allow_llm_call() -> tuple[bool, str]:
 
 def charge_llm_call() -> None:
     with _LOCK:
-        st = _load()
+        st = _roll_day(_load())
         cost = LLM_COST_PER_CALL_USDC
         st["credit"] = max(0.0, float(st.get("credit") or 0.0) - cost)
         st["spent"] = float(st.get("spent") or 0.0) + cost
+        st["spent_today"] = float(st.get("spent_today") or 0.0) + cost
         st["calls"] = int(st.get("calls") or 0) + 1
+        st["calls_today"] = int(st.get("calls_today") or 0) + 1
         st["ts"] = time.time()
         _save(st)
 

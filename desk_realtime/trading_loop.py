@@ -28,6 +28,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -50,6 +51,7 @@ from desk_realtime.engine_state import (
     consume_panic,
     set_valve,
     valve_closed,
+    valve_reason,
     write_engine_state,
 )
 from desk_realtime.fastforward import async_pause
@@ -61,15 +63,18 @@ DEPLOY_PATH = _ROOT / "grok-trading-desk" / "logs" / "desk.deploy"
 log = logging.getLogger("trading_loop")
 
 # ---------------------------------------------------------------------------
-# Single-position risk (author rule: one position at a time)
+# Book risk: 2 slots max. A second bag opens only after the first has a live mark.
 # ---------------------------------------------------------------------------
 
+MAX_SLOTS_CAP = 2
 isPositionOpen: bool = False
 net_out: int = 0
 scouted_count: int = 0
 _open: dict[str, Any] | None = None
+_book: list[dict[str, Any]] = []
 _wins = 0
 _losses = 0
+_sell_lock = threading.Lock()
 
 
 @dataclass
@@ -205,52 +210,367 @@ def _live_max_hold() -> float:
     return 10.0
 
 
+def _exit_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def max_slots() -> int:
+    """Hard ceiling is 2. A larger env value is ignored."""
+    raw = (os.environ.get("ARC_MAX_SLOTS") or "2").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 2
+    return max(1, min(n, MAX_SLOTS_CAP))
+
+
+def slots_free() -> int:
+    return max(0, max_slots() - len(_book))
+
+
+def held_addresses() -> set[str]:
+    return {str(p.get("token_address") or "").lower() for p in _book if p.get("token_address")}
+
+
+def marks_allow_new_slot() -> tuple[bool, str]:
+    """Empty book may open the first slot. A second slot needs a live quote on every open bag."""
+    if len(_book) >= max_slots():
+        return False, f"book full · {len(_book)}/{max_slots()}"
+    for pos in _book:
+        name = pos.get("token_name") or "?"
+        src = str(pos.get("mark_src") or "")
+        if src in ("", "sim", "sim_fallback", "none"):
+            return False, f"mark unread on {name} · no second slot"
+        held = time.time() - float(pos.get("opened_at") or time.time())
+        if held >= float(pos.get("max_hold_sec") or 900.0):
+            return False, f"exiting {name} · no second slot"
+    return True, ""
+
+
+def _resume_entries_if_allowed() -> None:
+    """A strategy halt only pauses entries while the bag is open. Panic stays shut."""
+    if _book or valve_reason() == "panic":
+        return
+    try:
+        from desk_realtime.arc_strategy import clear_valve_tight, day_loss_halt
+
+        halted, _why = day_loss_halt()
+        if halted:
+            return
+        clear_valve_tight()
+    except Exception:
+        return
+    set_valve(False)
+
+
+def _sync_alias() -> None:
+    """Panel and metrics still read one primary bag: the worst live mark."""
+    global isPositionOpen, _open
+    isPositionOpen = bool(_book)
+    if not _book:
+        _open = None
+        return
+
+    def rank(pos: dict[str, Any]) -> tuple[int, float]:
+        mult = pos.get("live_mult")
+        if mult is None:
+            return (1, 0.0)
+        return (0, float(mult))
+
+    _open = min(_book, key=rank)
+
+
+def _drop_position(position: dict[str, Any]) -> None:
+    addr = str(position.get("token_address") or "").lower()
+    name = str(position.get("token_name") or "").upper()
+    try:
+        from desk_realtime.arc_strategy import remember_close
+
+        remember_close(addr, name)
+    except Exception:
+        pass
+    kept: list[dict[str, Any]] = []
+    for pos in _book:
+        same_addr = bool(addr) and str(pos.get("token_address") or "").lower() == addr
+        same_name = bool(name) and str(pos.get("token_name") or "").upper() == name and not addr
+        if same_addr or same_name:
+            continue
+        kept.append(pos)
+    _book[:] = kept
+    _sync_alias()
+
+
+def _position_from_fill(token: str, address: str, stake: float, fill: dict[str, Any], launchpad: str, score: float) -> dict[str, Any]:
+    return {
+        "token_name": f"${token.lstrip('$')}",
+        "token_address": address,
+        "entry_size": stake,
+        "cost_usdc": float(fill.get("cost_usdc") or stake),
+        "token_amount": int(fill.get("token_amount") or 0),
+        "meme_token": str(fill.get("meme_token") or address),
+        "opened_at": time.time(),
+        "base_mult": 1.0,
+        "score": score,
+        "tx_id": fill.get("tx_id"),
+        "max_hold_sec": _live_max_hold(),
+        "dry_run": bool(fill.get("dry_run", True)),
+        "launchpad": launchpad or str(fill.get("launchpad") or ""),
+        "slippage_bps": fill.get("slippage_bps"),
+        "mark_src": "",
+    }
+
+
+def _failed_close(row: dict[str, Any]) -> bool:
+    detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+    note = str(detail.get("note") or "")
+    return note.startswith("ERROR") or "exit rpc failed" in note or "sell failed" in note
+
+
+def restore_open_book() -> int:
+    """Restart must not forget a live bag and open a third on top of it."""
+    if _book:
+        return len(_book)
+    rows: list[dict[str, Any]] = []
+    if LOG_PATH.is_file():
+        for line in LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    latest: dict[str, dict[str, Any]] = {}
+    first_ts: dict[str, str] = {}
+    for row in rows:
+        if row.get("type") not in ("buy", "close"):
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        if not sym or sym in ("DESK", "BOARD", "UNI", "TOKEN"):
+            continue
+        if row.get("type") == "close" and _failed_close(row):
+            continue
+        if row.get("type") == "close":
+            first_ts.pop(sym, None)
+            latest[sym] = row
+            continue
+        if sym not in first_ts:
+            first_ts[sym] = str(row.get("ts") or "")
+        latest[sym] = row
+    eng: dict[str, Any] = {}
+    try:
+        from desk_realtime.engine_state import read_engine_state
+
+        eng = read_engine_state()
+    except Exception:
+        eng = {}
+    saved = eng.get("open_book") if isinstance(eng.get("open_book"), list) else []
+    saved_by_name = {
+        str(item.get("token_name") or "").lstrip("$").upper(): item
+        for item in saved
+        if isinstance(item, dict)
+    }
+    restored: list[dict[str, Any]] = []
+    for sym, row in latest.items():
+        if row.get("type") != "buy":
+            continue
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+        note = str(detail.get("note") or "")
+        saved_row = saved_by_name.get(sym) or {}
+        address = str(row.get("token_address") or saved_row.get("token_address") or "")
+        if not address and str(eng.get("open_symbol") or "").lstrip("$").upper() == sym:
+            address = str(eng.get("open_address") or "")
+        if not address.startswith("0x") or len(address) != 42:
+            continue
+        token_amount = int(saved_row.get("token_amount") or 0)
+        if token_amount <= 0:
+            try:
+                from desk_realtime.arc_strategy import note_ghost_miss, remember_close
+
+                cost = float(saved_row.get("cost_usdc") or row.get("amount") or 0)
+                if note_ghost_miss(address, cost):
+                    remember_close(address, sym)
+            except Exception:
+                pass
+            continue
+        launchpad = str(row.get("launchpad") or saved_row.get("launchpad") or "")
+        if not launchpad and "uniswap" in note.lower():
+            launchpad = "uniswap"
+        try:
+            opened = datetime.fromisoformat(first_ts.get(sym) or str(row.get("ts") or "")).timestamp()
+        except ValueError:
+            opened = float(saved_row.get("opened_at") or time.time())
+        restored.append({
+            "token_name": f"${sym}",
+            "token_address": address,
+            "entry_size": float(row.get("amount") or saved_row.get("entry_size") or 0.5),
+            "cost_usdc": float(saved_row.get("cost_usdc") or row.get("amount") or 0.5),
+            "token_amount": int(saved_row.get("token_amount") or 0),
+            "opened_at": float(saved_row.get("opened_at") or opened),
+            "base_mult": 1.0,
+            "max_hold_sec": _live_max_hold(),
+            "dry_run": False,
+            "launchpad": launchpad or "uniswap",
+            "mark_src": str(saved_row.get("mark_src") or ""),
+            "live_mult": saved_row.get("live_mult"),
+            "peak_mult": saved_row.get("peak_mult"),
+        })
+    restored.sort(key=lambda p: float(p.get("opened_at") or 0))
+    _book[:] = restored[-max_slots():]
+    _sync_alias()
+    return len(_book)
+
+
 
 async def runScanner(bus: DeskPublisher, rng: random.Random) -> AgentResult:
-    global isPositionOpen, scouted_count
-    if isPositionOpen:
+    global scouted_count
+    allowed, why = marks_allow_new_slot()
+    if not allowed:
         return AgentResult(
             ok=False,
             agent_type="SCANNER",
-            log_text="scan skipped · one position at a time",
+            log_text=f"scan skipped · {why}",
             data={"skipped": True},
         )
 
     from desk_realtime.arc_launchpads import pick_scan_target
 
-    target = pick_scan_target(rng)
-    name, address = target.symbol, target.address
-    try:
-        from desk_realtime.arc_dex import market_identity
+    # New Uniswap pools only. The volume board is a watchlist, not a buy.
+    focus = os.environ.get("ARC_SCAN_FOCUS", "dex_top").strip().lower()
+    if focus in ("dex_top", "dex", "board"):
+        try:
+            from desk_realtime.arc_dex import pick_ranked_target, quiet_reason
+            from desk_realtime.arc_strategy import recently_closed
 
-        ident = await asyncio.to_thread(market_identity, address)
-        if ident.get("symbol"):
-            name = ident["symbol"]
+            ranked = await asyncio.to_thread(pick_ranked_target, held_addresses())
+            cool = ranked and recently_closed(str(ranked.get("address") or ""))
+            if cool:
+                ranked = None
+        except Exception:
+            ranked = None
+            cool = False
+        if focus in ("dex_top", "dex", "board") and not ranked:
+            try:
+                why = "rebuy cooldown" if cool else await asyncio.to_thread(quiet_reason)
+            except Exception:
+                why = "tape unread"
+            await bus.emit(
+                status="SCAN",
+                agent_type="SCANNER",
+                token_name="$BOARD",
+                entry_size=0,
+                log_text=f"early quiet · {why}",
+            )
+            return AgentResult(
+                ok=False,
+                agent_type="SCANNER",
+                log_text="board quiet",
+                data={"skipped": True},
+            )
+        if ranked:
+            check = ranked.get("check") or {}
+            name = check.get("symbol_onchain") or ranked["symbol"]
+            address = ranked["address"]
+            dex = str(check.get("dex") or ranked.get("dex") or "dex")
+            # Only a verified Uniswap route may be signed. Other DEXes stay read-only.
+            launchpad = "uniswap" if dex == "uniswap" else "board"
+            rank = int(ranked.get("rank") or 0)
+            vol = float(check.get("volume_h24") or 0)
+            scouted_count += 1
+            route = "uni route" if dex == "uniswap" else f"{dex} · route unread"
+            await bus.emit(
+                status="SCAN",
+                agent_type="SCANNER",
+                token_name=f"${name}",
+                entry_size=0,
+                log_text=(
+                    f"scan #{rank} ${name} · {route} · vol {vol:.0f}"
+                    f" · buyers {int(check.get('buyers_h1') or 0)}"
+                    f" · kline {check.get('kline') or 'unread'}"
+                ),
+                token_address=address,
+                scouted_count=scouted_count,
+                launchpad=launchpad,
+            )
+            await async_pause(0.15)
+            return AgentResult(
+                ok=True,
+                agent_type="SCANNER",
+                log_text=f"scan dex #{rank} ${name}",
+                data={
+                    "token": name,
+                    "token_address": address,
+                    "launchpad": launchpad,
+                    "platform_fee_bps": 0,
+                    "rank": rank,
+                },
+            )
+
+    # Mix Warp curves with Uniswap v3 tape when local-sign send is armed.
+    uni = None
+    try:
+        from desk_realtime.arc_uniswap import pick_uni_scan_target, send_armed
+
+        if send_armed() and rng.random() < float(os.environ.get("ARC_UNI_SCAN_P", "0.45")):
+            uni = pick_uni_scan_target(rng)
     except Exception:
-        ident = {}
+        uni = None
+    if uni:
+        name, address = uni["symbol"], uni["address"]
+        launchpad = "uniswap"
+        fee_bps = 0
+        fee_note = " · uni v3"
+    else:
+        target = pick_scan_target(rng)
+        name, address = target.symbol, target.address
+        launchpad = target.launchpad
+        fee_bps = target.fee_bps
+        fee_note = f" · fee {fee_bps}bps" if fee_bps else ""
+        try:
+            from desk_realtime.arc_dex import market_identity
+
+            ident = await asyncio.to_thread(market_identity, address)
+            if ident.get("symbol"):
+                name = ident["symbol"]
+        except Exception:
+            ident = {}
+    if str(address or "").lower() in held_addresses():
+        return AgentResult(
+            ok=False,
+            agent_type="SCANNER",
+            log_text=f"scan skipped · ${name} already open",
+            data={"skipped": True},
+        )
     scouted_count += 1
-    fee_note = f" · fee {target.fee_bps}bps" if target.fee_bps else ""
     await bus.emit(
         status="SCAN",
         agent_type="SCANNER",
         token_name=f"${name}",
         entry_size=0,
-        log_text=f"scan {target.launchpad} launch ${name}{fee_note}",
+        log_text=f"scan {launchpad} launch ${name}{fee_note}",
         token_address=address,
         scouted_count=scouted_count,
-        launchpad=target.launchpad,
-        platform_fee_bps=target.fee_bps,
+        launchpad=launchpad,
+        platform_fee_bps=fee_bps,
     )
     await async_pause(0.15)
     return AgentResult(
         ok=True,
         agent_type="SCANNER",
-        log_text=f"scan {target.launchpad} ${name}",
+        log_text=f"scan {launchpad} ${name}",
         data={
             "token": name,
             "token_address": address,
-            "launchpad": target.launchpad,
-            "platform_fee_bps": target.fee_bps,
+            "launchpad": launchpad,
+            "platform_fee_bps": fee_bps,
         },
     )
 
@@ -261,7 +581,14 @@ async def runNarrative(
     address: str,
     rng: random.Random,
 ) -> AgentResult:
-    scored = await score_narrative(token, address, rng=rng)
+    focus = os.environ.get("ARC_SCAN_FOCUS", "dex_top").strip().lower()
+    if focus in ("dex_top", "dex", "board"):
+        # Tape still decides the buy. Story runs in the same pass, not after the quote.
+        from desk_realtime.agent_scoring import scan_story
+
+        scored = await scan_story(token, address)
+    else:
+        scored = await score_narrative(token, address, rng=rng)
     try:
         from desk_realtime.cluster_book import publish_narrative
 
@@ -279,15 +606,18 @@ async def runNarrative(
     off = bool(scored.get("off_narrative") or not scored.get("ok"))
     x_m = scored.get("x_mentions")
     x_note = f" · X {x_m}" if x_m is not None else ""
+    official = scored.get("official") if isinstance(scored.get("official"), dict) else {}
+    official_line = str(official.get("line") or scored.get("note") or "")
+    story = f" · {official_line}" if official_line else ""
     await bus.emit(
         status="VOTING",
         agent_type="NARRATIVE",
         token_name=f"${token}",
         entry_size=0.5,
         log_text=(
-            "NOT BUY · off-narrative"
+            f"NOT BUY · {official_line or 'off-narrative'}"
             if off
-            else f"narrative {score:.2f} theme match ${token}{x_note}"
+            else f"narrative {score:.2f} theme match ${token}{x_note}{story}"
         ),
         score=score,
         token_address=address,
@@ -423,12 +753,22 @@ async def runRisk(
     rng: random.Random,
 ) -> AgentResult:
     """Secondary risk pass after consensus + audit (thin-book residual)."""
-    from desk_realtime.arc_strategy import LIQ_MIN_USDC, probe_liquidity_usdc
+    from desk_realtime.arc_dex import board_check, board_row_for
+    from desk_realtime.arc_strategy import LIQ_MIN_USDC, arc_book_score, probe_liquidity_usdc
 
+    from desk_realtime.arc_dex import trade_block
+
+    row = await asyncio.to_thread(board_row_for, address)
+    check = await asyncio.to_thread(board_check, row) if row else {}
+    book = arc_book_score(narr_score, row, check)
+    block = trade_block(row, check) if row else ""
     liq = probe_liquidity_usdc(address)
     depth = min(1.0, float(liq["liquidity_usdc"]) / max(LIQ_MIN_USDC, 1.0))
-    # Live book has no dice roll. Narrative below 0.62 already vetoed upstream.
-    veto = narr_score < 0.62 or bool(liq.get("veto"))
+    focus = os.environ.get("ARC_SCAN_FOCUS", "dex_top").strip().lower()
+    if focus in ("dex_top", "dex", "board") and row:
+        veto = bool(block) or bool(liq.get("veto"))
+    else:
+        veto = (not book["buy"]) or bool(liq.get("veto"))
     del rng
     await async_pause(0.08)
     if veto:
@@ -437,21 +777,31 @@ async def runRisk(
             agent_type="RISK",
             token_name=f"${token}",
             entry_size=0,
-            log_text="RISK VETO 100% · residual thin-book / narr",
+            log_text=(
+                f"SETUP {block or book['reason']}"
+                f" · BOOK {book['score']:.2f}"
+                f" · narr {book['parts']['narrative']:.2f}"
+                f" · vol {book['parts']['momentum']:.2f}"
+            ),
             risk_veto=True,
             token_address=address,
         )
         return AgentResult(
             ok=False,
             agent_type="RISK",
-            log_text="book too thin · risk veto",
+            log_text=f"BOOK {book['score']:.2f} · {book['reason']}",
             risk_veto=True,
             data={"depth": depth, "token": token, "token_address": address, "risk_pct": 100},
         )
     return AgentResult(
         ok=True,
         agent_type="RISK",
-        log_text=f"risk clear · depth {depth:.2f} · liq {liq['liquidity_usdc']:.0f} USDC",
+        log_text=(
+            f"BOOK {book['score']:.2f} ≥ {book['threshold']:.2f}"
+            f" · narr {book['parts']['narrative']:.2f}"
+            f" · vol {book['parts']['momentum']:.2f}"
+            f" · kline {book['parts']['kline']:.2f}"
+        ),
         data={"depth": depth, "token": token, "token_address": address, "risk_pct": 0},
     )
 
@@ -462,12 +812,67 @@ async def runTiming(
     address: str,
     stake: float,
     rng: random.Random,
+    *,
+    launchpad: str = "",
 ) -> AgentResult:
     del rng
-    from desk_realtime.arc_flow import live_buy_allowed
-
+    pad = (launchpad or "").strip().lower()
     ex = _active_executor()
     live = bool(getattr(ex, "live", False))
+
+    if pad in ("uniswap", "board"):
+        from desk_realtime.arc_uniswap import quote_roundtrip, send_armed
+
+        if live and not send_armed():
+            return AgentResult(
+                ok=False,
+                agent_type="TIMING",
+                log_text="timing hold · ARC_UNI_SEND off",
+                data={"token": token, "token_address": address},
+            )
+        try:
+            rt = await asyncio.to_thread(quote_roundtrip, address, usdc_in=min(float(stake), 0.3))
+        except Exception as exc:  # noqa: BLE001
+            return AgentResult(
+                ok=False,
+                agent_type="TIMING",
+                log_text=f"timing hold · uni quote failed · {sanitize_exc(exc)[:80]}",
+                data={"token": token, "token_address": address},
+            )
+        if not rt.get("ok"):
+            return AgentResult(
+                ok=False,
+                agent_type="TIMING",
+                log_text=f"timing hold · {rt.get('reason') or 'uni quote failed'}",
+                data={"token": token, "token_address": address},
+            )
+        if os.environ.get("ARC_LLM_VETO", "1").strip().lower() in ("1", "true", "yes", "on"):
+            scored = await score_narrative(token, address)
+            if scored.get("off_narrative") and float(scored.get("score") or 0) < 0.25:
+                return AgentResult(
+                    ok=False,
+                    agent_type="TIMING",
+                    log_text="timing hold · narrative veto · hostile story",
+                    data={"token": token, "token_address": address},
+                )
+        return AgentResult(
+            ok=True,
+            agent_type="TIMING",
+            log_text=(
+                f"entry ${token} uni armed {stake:.2f} {QUOTE} · "
+                f"{float(rt.get('usdc_in') or 0):.2f}→{float(rt.get('usdc_out') or 0):.2f}"
+            ),
+            data={
+                "token": token,
+                "token_address": address,
+                "stake": stake,
+                "launchpad": "uniswap",
+                "usdc_out": rt.get("usdc_out"),
+            },
+        )
+
+    from desk_realtime.arc_flow import live_buy_allowed
+
     gate = live_buy_allowed(address, live=live)
     if live and not gate.get("ok"):
         return AgentResult(
@@ -509,8 +914,10 @@ async def runTiming(
 
 
 def _active_executor():
-    """Route fills to Arc testnet when DESK_CHAIN=arc (default for Arc desk)."""
+    """Route fills to Arc when DESK_CHAIN=arc. RH Chain uses desk_realtime.rh_loop."""
     chain = os.environ.get("DESK_CHAIN", "arc").strip().lower()
+    if chain in ("robinhood", "rh", "rhchain"):
+        raise RuntimeError("DESK_CHAIN=robinhood · use python -m desk_realtime.rh_loop (Arc off)")
     if chain == "arc":
         from desk_realtime.arc_executor import get_arc_executor
 
@@ -545,7 +952,7 @@ async def executeBuyOrder(
 
     ex = _active_executor()
     pad = (launchpad or "").strip().lower()
-    if pad in ("tolly", "dyor"):
+    if pad not in ("", "warp", "uniswap", "board"):
         return {
             "ok": False,
             "error": (
@@ -553,6 +960,44 @@ async def executeBuyOrder(
                 "refusing cast send"
             ),
             "dry_run": True,
+        }
+    if pad in ("uniswap", "board"):
+        from desk_realtime.arc_uniswap import execute_swap_plan, send_armed
+
+        if not send_armed():
+            return {"ok": False, "error": "ARC_UNI_SEND off · no broadcast", "dry_run": True}
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    execute_swap_plan,
+                    None,
+                    token_out=token_address,
+                    usdc_in=float(stake_size),
+                    symbol=symbol,
+                ),
+                timeout=45.0,
+            )
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "uni buy timeout", "dry_run": False}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": sanitize_exc(exc), "dry_run": False}
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": result.get("reason") or "uni buy failed",
+                "dry_run": False,
+                "balance_usdc": sized.get("balance_usdc"),
+            }
+        return {
+            "ok": True,
+            "tx_id": result.get("tx_id") or "",
+            "cost_usdc": float(result.get("usdc_in") or stake_size),
+            "token_amount": int(result.get("token_amount") or 0),
+            "meme_token": token_address,
+            "dry_run": False,
+            "launchpad": "uniswap",
+            "slippage_bps": int(float(os.environ.get("ARC_UNI_SLIPPAGE", "1.0")) * 100),
+            "balance_usdc": sized.get("balance_usdc"),
         }
     if getattr(ex, "live", False):
         from desk_realtime.arc_flow import live_buy_allowed
@@ -593,6 +1038,54 @@ async def executeSellOrder(
     min_usdc_out: int = 0,
 ) -> dict[str, Any]:
     """Market flatten — normal / trailing / PANIC (Arc USDC slip 15–20% on urgency)."""
+    pad = (launchpad or "").strip().lower()
+    if pad in ("uniswap", "board"):
+        from desk_realtime.arc_uniswap import erc20_balance, execute_swap_plan, send_armed
+
+        if not send_armed():
+            return {"ok": False, "error": "ARC_UNI_SEND off · cannot sell uni", "dry_run": True}
+
+        def _sell_once(amount_token: int) -> dict[str, Any]:
+            if not _sell_lock.acquire(blocking=False):
+                return {"ok": False, "reason": "sell already in flight"}
+            try:
+                return execute_swap_plan(
+                    None,
+                    token_in=token_address,
+                    amount_token=amount_token,
+                    symbol=symbol,
+                    side="sell",
+                )
+            finally:
+                _sell_lock.release()
+
+        amount = int(token_amount or 0)
+        try:
+            held = await asyncio.to_thread(erc20_balance, token_address)
+        except Exception:
+            held = 0
+        if held > 0:
+            amount = held if fraction >= 1.0 else max(1, int(held * float(fraction)))
+        elif amount <= 0:
+            return {"ok": False, "error": "uni sell · token balance empty", "dry_run": False}
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_sell_once, amount),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "uni sell timeout", "dry_run": False}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": sanitize_exc(exc), "dry_run": False}
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("reason") or "uni sell failed", "dry_run": False}
+        return {
+            "ok": True,
+            "tx_id": result.get("tx_id") or "",
+            "dry_run": False,
+            "launchpad": "uniswap",
+            "token_amount": amount,
+        }
     ex = _active_executor()
     try:
         return await asyncio.wait_for(
@@ -628,27 +1121,37 @@ async def runExit(
     curve = str(position.get("token_address") or "")
     token_amt = int(position.get("token_amount") or 0)
 
-    # On-chain mark via quoteSell; fall back to last base_mult only if quote fails
+    # Uniswap bags are quoted token→USDC. Warp still uses quoteSell. Never invent upside.
     mark_src = "sim"
     live_mult = 0.0
     mark_usdc = 0.0
+    pad = str(position.get("launchpad") or "").lower()
     try:
-        ex = _active_executor()
-        if hasattr(ex, "mark_position") and curve.startswith("0x"):
+        if pad in ("uniswap", "board") and curve.startswith("0x"):
+            from desk_realtime.arc_uniswap import quote_held_mark
+
             mark = await asyncio.to_thread(
-                ex.mark_position,
+                quote_held_mark,
                 curve,
                 token_amount=token_amt,
                 cost_usdc=cost,
             )
-            if float(mark.get("live_mult") or 0) > 0:
-                live_mult = float(mark["live_mult"])
-                mark_usdc = float(mark.get("mark_usdc") or 0)
-                mark_src = str(mark.get("source") or "quoteSell")
-                if int(mark.get("token_amount") or 0) > 0:
-                    position["token_amount"] = int(mark["token_amount"])
-                    if _open is not None:
-                        _open["token_amount"] = int(mark["token_amount"])
+        else:
+            mark = {}
+            ex = _active_executor()
+            if hasattr(ex, "mark_position") and curve.startswith("0x"):
+                mark = await asyncio.to_thread(
+                    ex.mark_position,
+                    curve,
+                    token_amount=token_amt,
+                    cost_usdc=cost,
+                )
+        if float(mark.get("live_mult") or 0) > 0:
+            live_mult = float(mark["live_mult"])
+            mark_usdc = float(mark.get("mark_usdc") or 0)
+            mark_src = str(mark.get("source") or "quoteSell")
+            if int(mark.get("token_amount") or 0) > 0:
+                position["token_amount"] = int(mark["token_amount"])
     except Exception as exc:  # noqa: BLE001
         log.info("mark_position failed: %s", sanitize_exc(exc))
 
@@ -662,14 +1165,18 @@ async def runExit(
     peak = float(position.get("peak_mult") or live_mult)
     peak = max(peak, live_mult)
     position["peak_mult"] = peak
-    if _open is not None:
-        _open["peak_mult"] = peak
-        _open["live_mult"] = live_mult
-        _open["mark_usdc"] = mark_usdc
+    position["live_mult"] = live_mult
+    position["mark_usdc"] = mark_usdc
+    position["mark_src"] = mark_src
+    _sync_alias()
 
-    # Trailing stop: give back ≥12% from peak mark → widen slip & smash out
+    # Trail only after a real push. 12% off 1.35x sells the first wick on this tape.
+    trail_arm = _exit_float("ARC_TRAIL_ARM", 2.0)
+    trail_give = _exit_float("ARC_TRAIL_GIVEBACK", 0.20)
+    take_profit = _exit_float("ARC_TAKE_PROFIT", 8.0)
+    hard_stop_mult = _exit_float("ARC_HARD_STOP", 0.85)
     trail_dd = (peak - live_mult) / peak if peak > 0 else 0.0
-    trailing_hit = peak >= 1.35 and trail_dd >= 0.12
+    trailing_hit = peak >= trail_arm and trail_dd >= trail_give
 
     await bus.emit(
         status="BUY",
@@ -677,6 +1184,8 @@ async def runExit(
         token_name=position["token_name"],
         entry_size=position["entry_size"],
         mult=live_mult,
+        mark_usdc=mark_usdc,
+        mark_src=mark_src,
         log_text=(
             f"HOLD {position['token_name']} · {live_mult:.2f}x mark ({mark_src})"
             + (f" · ${mark_usdc:.2f}" if mark_usdc > 0 else "")
@@ -692,9 +1201,9 @@ async def runExit(
 
         unreal = (mark_usdc - cost) if mark_usdc > 0 else entry * (live_mult - 1.0)
         equity = (mark_usdc if mark_usdc > 0 else entry * live_mult)
-        tight, why = should_tighten_valve(unreal, equity)
+        tight, why = should_tighten_valve(unreal, equity, cost_usdc=cost or entry)
         if tight:
-            set_valve(True)
+            set_valve(True, reason="strategy")
             await bus.emit(
                 status="HOLD_OFF",
                 agent_type="RISK",
@@ -706,10 +1215,10 @@ async def runExit(
         pass
 
     # Also exit if mark < 0.85x (hard stop) or graduated bag dump via time
-    hard_stop = live_mult > 0 and live_mult <= 0.85 and mark_src != "sim_fallback"
+    hard_stop = live_mult > 0 and live_mult <= hard_stop_mult and mark_src != "sim_fallback"
     should_exit = (
         held >= float(position.get("max_hold_sec") or _live_max_hold())
-        or live_mult >= 4.0
+        or live_mult >= take_profit
         or trailing_hit
         or hard_stop
     )
@@ -731,13 +1240,36 @@ async def runExit(
         token_amount=int(position.get("token_amount") or 0),
     )
     if not fill.get("ok"):
+        err = str(fill.get("error") or "unknown")
+        if "token balance empty" in err:
+            from desk_realtime.arc_strategy import note_ghost_miss
+
+            note_ghost_miss(curve, cost or entry)
+            await bus.emit(
+                status="EXIT",
+                agent_type="EXIT",
+                token_name=position["token_name"],
+                entry_size=position["entry_size"],
+                log_text=f"ghost dropped · {err} · slot cleared",
+                token_address=position.get("token_address"),
+            )
+            _drop_position(position)
+            _resume_entries_if_allowed()
+            return AgentResult(
+                ok=True,
+                agent_type="EXIT",
+                log_text="ghost dropped",
+                data={"closed": True, "error": err},
+            )
         await bus.emit(
-            status="EXIT",
+            status="BUY",
             agent_type="EXIT",
             token_name=position["token_name"],
             entry_size=position["entry_size"],
             mult=live_mult,
-            log_text=f"ERROR · exit rpc failed · {fill.get('error') or 'unknown'}",
+            mark_src=mark_src,
+            log_text=f"ERROR · exit rpc failed · {err}",
+            token_address=position.get("token_address"),
         )
         return AgentResult(
             ok=False,
@@ -767,7 +1299,7 @@ async def runExit(
         pnl_net = pnl_net - gas
         credit_from_pnl(pnl_net)
         if ledger.get("valve_tight"):
-            set_valve(True)
+            set_valve(True, reason="strategy")
     except Exception:
         pass
 
@@ -793,8 +1325,8 @@ async def runExit(
         trailing=trailing_hit,
         slippage_bps=fill.get("slippage_bps"),
     )
-    isPositionOpen = False
-    _open = None
+    _drop_position(position)
+    _resume_entries_if_allowed()
     return AgentResult(
         ok=True,
         agent_type="EXIT",
@@ -814,55 +1346,67 @@ async def runExit(
 async def execute_panic_flatten(bus: DeskPublisher, req: dict[str, Any] | None = None) -> None:
     """
     PANIC SELL / EXIT — bypass ALL agent scoring.
-    Market-flatten open book + close Valve Gate (halt auto-buy).
+    Market-flatten every open slot + close Valve Gate (halt auto-buy).
     """
-    global isPositionOpen, _open, _wins, _losses
+    global _wins, _losses
 
-    set_valve(True)  # Valve Gate CLOSED + desk.halt
+    set_valve(True, reason="panic")
     req = req or {}
-    pos = _open
-    sym = str(
-        (pos or {}).get("token_name")
-        or req.get("symbol")
-        or "UNK"
-    ).lstrip("$")
-    addr = str(
-        (pos or {}).get("token_address")
-        or req.get("token_address")
-        or ""
-    )
-
+    positions = list(_book)
+    if not positions and req.get("token_address"):
+        positions = [{
+            "token_name": f"${str(req.get('symbol') or 'UNK').lstrip('$')}",
+            "token_address": str(req.get("token_address") or ""),
+            "entry_size": 0.5,
+            "launchpad": "uniswap",
+            "token_amount": 0,
+            "base_mult": 1.0,
+        }]
+    names = ", ".join(str(p.get("token_name") or "?") for p in positions) or "$DESK"
     await bus.emit(
         status="HOLD_OFF",
         agent_type="EXIT",
-        token_name=f"${sym}",
-        entry_size=float((pos or {}).get("entry_size") or 0.5),
-        log_text=f"PANIC · valve CLOSED · flattening ${sym}",
+        token_name=names.split(",")[0].strip(),
+        entry_size=float((positions[0].get("entry_size") if positions else 0) or 0),
+        log_text=f"PANIC · valve CLOSED · flattening {names}",
         op="halt",
     )
-
-    if not pos and not addr:
+    if not positions:
         await bus.emit(
             status="HOLD_OFF",
             agent_type="EXIT",
             token_name="$DESK",
-            entry_size=0.5,
+            entry_size=0,
             log_text="PANIC · no open book · scanning halted",
         )
         return
 
-    fill = await executeSellOrder(
-        addr,
-        symbol=sym,
-        fraction=1.0,
-        panic=True,
-        launchpad=str((_open or {}).get("launchpad") or ""),
-        token_amount=int((_open or {}).get("token_amount") or 0),
-    )
-    mult = float((pos or {}).get("base_mult") or 1.0)
-    entry = float((pos or {}).get("entry_size") or 0.5)
-    pnl_net = entry * (mult - 1.0)
-    if fill.get("ok"):
+    for pos in positions:
+        sym = str(pos.get("token_name") or "UNK").lstrip("$")
+        addr = str(pos.get("token_address") or "")
+        fill = await executeSellOrder(
+            addr,
+            symbol=sym,
+            fraction=1.0,
+            panic=True,
+            launchpad=str(pos.get("launchpad") or ""),
+            token_amount=int(pos.get("token_amount") or 0),
+        )
+        mult = float(pos.get("live_mult") or pos.get("base_mult") or 1.0)
+        entry = float(pos.get("entry_size") or 0.5)
+        pnl_net = entry * (mult - 1.0)
+        if not fill.get("ok"):
+            await bus.emit(
+                status="EXIT",
+                agent_type="EXIT",
+                token_name=f"${sym}",
+                entry_size=entry,
+                mult=mult,
+                log_text=f"ERROR · PANIC sell failed · {fill.get('error') or 'rpc'}",
+                token_address=addr,
+                panic=True,
+            )
+            continue
         if mult >= 1.0:
             _wins += 1
         else:
@@ -876,7 +1420,7 @@ async def execute_panic_flatten(bus: DeskPublisher, req: dict[str, Any] | None =
                 entry_usdc=entry,
                 exit_mult=mult,
                 gas_usdc=gas,
-                equity_mark=entry * mult,
+                equity_mark=float(pos.get("mark_usdc") or 0) or entry * mult,
             )
             pnl_net = entry * (mult - 1.0) - gas
             credit_from_pnl(pnl_net)
@@ -899,19 +1443,7 @@ async def execute_panic_flatten(bus: DeskPublisher, req: dict[str, Any] | None =
             panic=True,
             slippage_bps=slip,
         )
-    else:
-        await bus.emit(
-            status="EXIT",
-            agent_type="EXIT",
-            token_name=f"${sym}",
-            entry_size=float((pos or {}).get("entry_size") or 0.5),
-            mult=mult,
-            log_text=f"ERROR · PANIC sell failed · {fill.get('error') or 'rpc'}",
-            panic=True,
-        )
-
-    isPositionOpen = False
-    _open = None
+        _drop_position(pos)
 
 
 async def _reject(
@@ -943,10 +1475,26 @@ async def run_agent_pipeline(
     stake: float,
     rng: random.Random,
 ) -> None:
-    global isPositionOpen, _open
+    global _open
 
-    if isPositionOpen or valve_closed():
+    allowed, why = marks_allow_new_slot()
+    if not allowed or valve_closed():
         return
+    try:
+        from desk_realtime.arc_strategy import day_loss_halt
+
+        halted, why = day_loss_halt()
+        if halted:
+            await bus.emit(
+                status="HOLD_OFF",
+                agent_type="RISK",
+                token_name="$DESK",
+                entry_size=0,
+                log_text=f"DAY HALT · {why} · no new buys",
+            )
+            return
+    except Exception:
+        pass
 
     scan = await runScanner(bus, rng)
     if scan.data.get("skipped") or not scan.ok:
@@ -1036,8 +1584,11 @@ async def run_agent_pipeline(
     try:
         from desk_realtime.arc_strategy import edge_model_r
 
+        tape = os.environ.get("ARC_SCAN_FOCUS", "dex_top").strip().lower() in (
+            "dex_top", "dex", "board",
+        )
         edge = edge_model_r(
-            float(narr.data.get("score") or 0.55),
+            0.55 if tape else float(narr.data.get("score") or 0.55),
             1.8,
             1.0,
             launchpad=launchpad,
@@ -1066,9 +1617,13 @@ async def run_agent_pipeline(
     except Exception:
         pass
 
-    timing = await runTiming(bus, token, address, stake, rng)
+    timing = await runTiming(bus, token, address, stake, rng, launchpad=launchpad)
     if timing.vetoed:
         await _reject(bus, token, "TIMING", timing.log_text, risk_veto=False)
+        return
+
+    if str(address or "").lower() in held_addresses():
+        await _reject(bus, token, "RISK", f"${token} already open · slot kept")
         return
 
     fill = await executeBuyOrder(address, stake, symbol=token, launchpad=launchpad)
@@ -1081,22 +1636,11 @@ async def run_agent_pipeline(
         return
 
     isPositionOpen = True
-    _open = {
-        "token_name": f"${token}",
-        "token_address": address,
-        "entry_size": stake,
-        "cost_usdc": float(fill.get("cost_usdc") or stake),
-        "token_amount": int(fill.get("token_amount") or 0),
-        "meme_token": str(fill.get("meme_token") or ""),
-        "opened_at": time.time(),
-        "base_mult": 1.0,
-        "score": float(narr.data["score"]),
-        "tx_id": fill.get("tx_id"),
-        "max_hold_sec": _live_max_hold(),
-        "dry_run": bool(fill.get("dry_run", True)),
-        "launchpad": launchpad,
-        "slippage_bps": fill.get("slippage_bps"),
-    }
+    slot = _position_from_fill(
+        token, address, stake, fill, launchpad, float(narr.data["score"]),
+    )
+    _book.append(slot)
+    _sync_alias()
     await bus.emit(
         status="BUY",
         agent_type="TIMING",
@@ -1109,7 +1653,7 @@ async def run_agent_pipeline(
         token_address=address,
         score=float(narr.data["score"]),
         tx_id=fill.get("tx_id"),
-        mult=_open["base_mult"],
+        mult=slot["base_mult"],
         launchpad=launchpad,
     )
 
@@ -1140,7 +1684,9 @@ async def emit_metrics(bus: DeskPublisher, boot: float) -> None:
         "day": max(1, 1 + up // 86400),
         "desk_mode": "HALTED" if halted else ("OPEN" if isPositionOpen else "LIVE"),
         "is_position_open": isPositionOpen,
-        "multiple": (float(_open["base_mult"]) if _open else 0.0),
+        "slots_open": len(_book),
+        "slots_max": max_slots(),
+        "multiple": (float(_open.get("live_mult") or _open.get("base_mult") or 0) if _open else 0.0),
         "valve_gate": "CLOSED" if halted else "OPEN",
         "realized_net_usdc": realized_net,
         "pnl": realized_net,
@@ -1151,9 +1697,26 @@ async def emit_metrics(bus: DeskPublisher, boot: float) -> None:
         "desk_mode": payload["desk_mode"],
         "valve_gate": payload["valve_gate"],
         "is_position_open": isPositionOpen,
+        "slots_open": len(_book),
+        "slots_max": max_slots(),
         "open_symbol": (_open or {}).get("token_name"),
         "open_address": (_open or {}).get("token_address"),
-        "open_mult": (_open or {}).get("base_mult"),
+        "open_mult": (_open or {}).get("live_mult") or (_open or {}).get("base_mult"),
+        "open_book": [
+            {
+                "token_name": p.get("token_name"),
+                "token_address": p.get("token_address"),
+                "entry_size": p.get("entry_size"),
+                "cost_usdc": p.get("cost_usdc"),
+                "token_amount": p.get("token_amount"),
+                "opened_at": p.get("opened_at"),
+                "launchpad": p.get("launchpad"),
+                "mark_src": p.get("mark_src"),
+                "live_mult": p.get("live_mult"),
+                "peak_mult": p.get("peak_mult"),
+            }
+            for p in _book
+        ],
         "net_out": net_out,
         "scouted_count": scouted_count,
         "win_rate": payload["win_rate"],
@@ -1174,6 +1737,7 @@ async def trading_main_loop(
     bus = DeskPublisher(ws_url)
     await bus.ensure_connected()
     boot = time.time()
+    restored = restore_open_book()
 
     # Probe RPC once (async, timed) — never blocks Streamlit
     health = await get_executor().health_check()
@@ -1183,7 +1747,8 @@ async def trading_main_loop(
         token_name="$DESK",
         entry_size=stake,
         log_text=(
-            "trading loop armed · one position at a time"
+            f"trading loop armed · {max_slots()} slots"
+            + (f" · restored {restored}" if restored else "")
             + (" · rpc ok" if health.get("ok") else " · rpc degraded")
         ),
         net_out=net_out,
@@ -1194,10 +1759,28 @@ async def trading_main_loop(
     last_factory = 0.0
     last_dex = 0.0
     pads_announced = False
+    journal_day = time.strftime("%Y-%m-%d", time.localtime())
 
     try:
         while True:
             now = time.time()
+            today = time.strftime("%Y-%m-%d", time.localtime())
+            if today != journal_day:
+                prev = journal_day
+                journal_day = today
+                try:
+                    from desk_realtime.daily_journal import write_journal
+
+                    path = await asyncio.to_thread(write_journal, prev)
+                    await bus.emit(
+                        status="SCAN",
+                        agent_type="SCANNER",
+                        token_name="$JOURNAL",
+                        entry_size=0,
+                        log_text=f"journal {prev} · {path.name}",
+                    )
+                except Exception:
+                    journal_day = prev
             if now - last_factory >= factory_every:
                 last_factory = now
                 try:
@@ -1257,6 +1840,9 @@ async def trading_main_loop(
                             sym = row.get("symbol") or ""
                             if sym and sym not in " ".join(bits):
                                 bits.append(f"{sym} {float(row.get('liquidity_usdc') or 0):.0f}")
+                        n = int(book.get("board_n") or 0)
+                        if n:
+                            bits.insert(0, f"top{n}")
                         if not bits:
                             bits.append("arc tape unread")
                         if bits:
@@ -1267,44 +1853,78 @@ async def trading_main_loop(
                                 entry_size=0,
                                 log_text="dexscreener arc · " + " · ".join(bits[:4]),
                             )
+                        tape_line = str(book.get("timeline") or "")
+                        if tape_line:
+                            await bus.emit(
+                                status="SCAN",
+                                agent_type="SCANNER",
+                                token_name="$TAPE",
+                                entry_size=0,
+                                log_text="timelines · " + tape_line,
+                            )
+                        from desk_realtime.arc_uniswap import quote_tape
+
+                        quotes = await asyncio.to_thread(quote_tape, book.get("tape") or [])
+                        qbits = []
+                        for q in quotes:
+                            sym = q.get("symbol") or "?"
+                            if q.get("ok"):
+                                qbits.append(
+                                    f"{sym} {float(q.get('usdc_in') or 0):.2f}"
+                                    f"→{float(q.get('usdc_out') or 0):.2f}"
+                                )
+                            else:
+                                qbits.append(f"{sym} unread")
+                        from desk_realtime.arc_uniswap import send_armed, swap_api_status
+
+                        api = await asyncio.to_thread(swap_api_status)
+                        if api.get("listed") and send_armed() and api.get("has_key"):
+                            qbits.append("api send armed")
+                        elif api.get("listed"):
+                            qbits.append("api listed")
+                        elif "unread" in str(api.get("reason") or ""):
+                            qbits.append("api unread")
+                        else:
+                            qbits.append("api absent")
+                        if qbits:
+                            await bus.emit(
+                                status="SCAN",
+                                agent_type="SCANNER",
+                                token_name="$UNI",
+                                entry_size=0,
+                                log_text="uniswap quote · " + " · ".join(qbits) + " · no send",
+                            )
                 except Exception:
                     pass
 
-            # Valve Gate / emergency halt — pause scan; still allow exit marks
+            # Valve Gate closes new buys only. A live bag still marks and can hard-stop.
             if valve_closed() or HALT_PATH.exists():
-                if isPositionOpen and _open is not None:
-                    # Halt blocks NEW buys but still publish marks (no auto exit on halt
-                    # unless panic). Keep book visible.
-                    await bus.emit(
-                        status="BUY",
-                        agent_type="EXIT",
-                        token_name=_open["token_name"],
-                        entry_size=_open["entry_size"],
-                        mult=_open.get("base_mult"),
-                        log_text=f"HALT · holding {_open['token_name']} · valve CLOSED",
-                        token_address=_open.get("token_address"),
-                    )
-                else:
-                    await bus.emit(
-                        status="HOLD_OFF",
-                        agent_type="EXIT",
-                        token_name="$DESK",
-                        entry_size=stake,
-                        log_text="EMERGENCY STOP · scanning paused · valve CLOSED",
-                    )
-                await emit_metrics(bus, boot)
-                await async_pause(1.0)
-                continue
+                for pos in list(_book):
+                    await runExit(bus, pos, rng)
+                _resume_entries_if_allowed()
+                if valve_closed() or HALT_PATH.exists():
+                    if not _book:
+                        await bus.emit(
+                            status="HOLD_OFF",
+                            agent_type="EXIT",
+                            token_name="$DESK",
+                            entry_size=stake,
+                            log_text="VALVE CLOSED · no new buys · book flat",
+                        )
+                    await emit_metrics(bus, boot)
+                    await async_pause(exit_every)
+                    continue
 
-            if isPositionOpen and _open is not None:
-                await runExit(bus, _open, rng)
+            for pos in list(_book):
+                await runExit(bus, pos, rng)
+            allowed, _why = marks_allow_new_slot()
+            if allowed:
+                await run_agent_pipeline(bus, stake=stake, rng=rng)
                 await emit_metrics(bus, boot)
-                await async_pause(exit_every)
+                await async_pause(scan_every if not _book else exit_every)
                 continue
-
-            await run_agent_pipeline(bus, stake=stake, rng=rng)
             await emit_metrics(bus, boot)
-            await async_pause(scan_every)
+            await async_pause(exit_every)
     finally:
         await bus.close()
 

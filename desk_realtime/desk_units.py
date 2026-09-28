@@ -1,8 +1,7 @@
-"""Desk quote-asset contract — Arc Testnet = native USDC; Solana fallback = SOL.
+"""Desk quote-asset contract — Arc USDC / Robinhood Chain USDG / Solana SOL.
 
-Arc (Circle L1): USDC is gas + settlement. No SOL / no separate gas token.
-Paper sizes track faucet-scale wallets (~20 USDC) so the scoreboard reads as
-an Arc session, not a Solana trench book.
+Arc (Circle L1): USDC is gas + settlement.
+Robinhood Chain (4663): ETH gas; desk notional in USDG on Uniswap v3.
 """
 
 from __future__ import annotations
@@ -11,7 +10,14 @@ import os
 
 DESK_CHAIN = os.environ.get("DESK_CHAIN", "arc").strip().lower()
 
-if DESK_CHAIN == "arc":
+if DESK_CHAIN in ("robinhood", "rh", "rhchain"):
+    QUOTE = "USDG"
+    STAKE = float(os.environ.get("DESK_STAKE", os.environ.get("RH_BET_HARD_CAP", "0.3")))
+    ENTRY = float(os.environ.get("DESK_ENTRY", os.environ.get("RH_BET_HARD_CAP", "0.3")))
+    CHAIN_LABEL = "robinhood"
+    CHAIN_ID = int(os.environ.get("RH_CHAIN_ID", "4663"))
+    FEE_BLURB = "gas (ETH) and slippage included"
+elif DESK_CHAIN == "arc":
     QUOTE = "USDC"
     # Principal follows live wallet when possible; env is fallback only
     STAKE = float(os.environ.get("DESK_STAKE", "0"))
@@ -54,6 +60,9 @@ def normalize_fill_amount(raw: float | None) -> float:
             return ENTRY
         # Legacy USD-sized paper (~75) → ENTRY
         if amt > STAKE * 2:
+            return ENTRY
+    elif DESK_CHAIN in ("robinhood", "rh", "rhchain"):
+        if amt <= 0 or amt > max(STAKE * 5, 5.0):
             return ENTRY
     else:
         if amt > 20:

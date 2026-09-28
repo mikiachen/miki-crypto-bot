@@ -49,7 +49,36 @@ log = logging.getLogger("desk")
 
 def load_config(path: str | Path) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+        cfg = yaml.safe_load(handle) or {}
+    return apply_env_secrets(cfg)
+
+
+def apply_env_secrets(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Prefer process env over yaml placeholders. Never log the values."""
+    import os
+
+    grok = cfg.setdefault("grok", {})
+    if not isinstance(grok, dict):
+        grok = {}
+        cfg["grok"] = grok
+    env_grok = (os.environ.get("GROK_API_KEY") or os.environ.get("XAI_API_KEY") or "").strip()
+    raw_grok = str(grok.get("api_key") or "")
+    if env_grok and (not raw_grok or "REPLACE" in raw_grok.upper()):
+        grok["api_key"] = env_grok
+
+    alpaca = cfg.setdefault("alpaca", {})
+    if not isinstance(alpaca, dict):
+        alpaca = {}
+        cfg["alpaca"] = alpaca
+    env_key = (os.environ.get("ALPACA_API_KEY") or "").strip()
+    env_secret = (os.environ.get("ALPACA_API_SECRET") or "").strip()
+    raw_key = str(alpaca.get("api_key") or "")
+    raw_secret = str(alpaca.get("api_secret") or "")
+    if env_key and (not raw_key or "REPLACE" in raw_key.upper()):
+        alpaca["api_key"] = env_key
+    if env_secret and (not raw_secret or "REPLACE" in raw_secret.upper()):
+        alpaca["api_secret"] = env_secret
+    return cfg
 
 
 def _parse_hhmm(value: str, default: dtime) -> dtime:
@@ -517,16 +546,25 @@ class TradingDesk:
 
     # -- entry point ---------------------------------------------------------------------
 
-    async def run(self) -> None:
+    async def run(self, *, stocks_only: bool = False) -> None:
         log.info(
-            "desk starting — dry_run=%s, stock execution=%s, models=%s/%s, live_search=%s",
+            "desk starting — dry_run=%s, stocks_only=%s, stock execution=%s, models=%s/%s, live_search=%s",
             self.dry_run,
+            stocks_only,
             "paper" if self.stock_executor.paper else "LIVE",
             self.analyst.model,
             self.stock_checker.model,
             self.analyst.live_search,
         )
         log.info("outcome memory: %d closed trades loaded", self.refresh_memory())
+        if stocks_only:
+            # Robinhood-style equity book only. No pump.fun / Arc crypto loop.
+            await asyncio.gather(
+                self.stock_loop(),
+                self.exit_loop(),
+                self.allocator_loop(),
+            )
+            return
         await asyncio.gather(
             self.crypto_loop(),
             self.stock_loop(),
@@ -539,6 +577,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Grok Trading Desk")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--dry-run", action="store_true", help="decide and log, never execute")
+    parser.add_argument(
+        "--stocks-only",
+        action="store_true",
+        help="US equities book only (Alpaca). Skips Solana/pump.fun crypto loop",
+    )
     parser.add_argument(
         "--i-understand-the-risk",
         action="store_true",
@@ -555,7 +598,7 @@ def main() -> None:
 
     desk = TradingDesk(load_config(args.config), dry_run=args.dry_run, live_ack=args.live_ack)
     try:
-        asyncio.run(desk.run())
+        asyncio.run(desk.run(stocks_only=args.stocks_only))
     except KeyboardInterrupt:
         log.info("desk stopped")
 
